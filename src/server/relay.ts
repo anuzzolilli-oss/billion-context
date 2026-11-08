@@ -796,6 +796,7 @@ async function forwardCaptured(
             // (reference-inequality); otherwise this is byte-identical to
             // prepared.originalMessages.
             originalMessages: prepared.judgeBaseline ?? prepared.originalMessages,
+            expectedFoldedMessages: prepared.expectedFoldedMessages,
             body: sentBody,
             protocol: prepared.protocol,
             sessionId: prepared.session.id,

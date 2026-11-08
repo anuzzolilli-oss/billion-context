@@ -1923,6 +1923,7 @@ export type Prepared = {
      *  from the frozen prefix). Undefined = client-authoritative turn, the
      *  judge keeps originalMessages (byte-identical behavior). */
     judgeBaseline?: readonly CoreMessage[];
+    expectedFoldedMessages?: readonly CoreMessage[];
     protocol: WireProtocol;
     stream: boolean;
     compressInjected: boolean;

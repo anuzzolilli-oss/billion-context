@@ -92,6 +92,9 @@ export interface JudgeVerdict {
 }
 
 interface JudgeOptions {
+  /** Trusted kernel projection from recorded active folds; validate every
+   *  surviving cell and the carrier, including cells preceding a tail anchor. */
+  expectedFoldedMessages?: readonly CoreMessage[];
   // Carriers are few per request; a wider gap than this before the next stable
   // match reads as a rewrite, not an injection. Default 4.
   maxCarrierGap?: number;
@@ -285,6 +288,15 @@ export function judgeInboundOutbound(
   exit: readonly CoreMessage[],
   opts: JudgeOptions = {},
 ): JudgeVerdict {
+  const pairingEntry = entry;
+  const projection = opts.expectedFoldedMessages;
+  if (projection !== undefined) entry = projection;
+  const equal = (a: CoreMessage, b: CoreMessage): boolean => projection !== undefined
+      && (isSummaryCarrier(a) || (a.contentType === "tool-call" && isCompressToolName(a.toolName)))
+    ? a.role === b.role && a.contentType === b.contentType
+      && (a.contentType !== "tool-call" || a.toolName === b.toolName)
+      && (a.text ?? "").replace(RENDER_TAG_RE, "").trim() === (b.text ?? "").replace(RENDER_TAG_RE, "").trim()
+    : stableEqual(a, b);
   const maxGap = opts.maxCarrierGap ?? 4;
   const maxExempt = opts.maxExempt ?? 128;
   const violations: Violation[] = [];
@@ -294,8 +306,8 @@ export function judgeInboundOutbound(
   // The fold point is the first summary carrier; everything before it is the
   // frozen prefix (must match), everything from it on is the fold/tail (free).
   const sumIdx = exit.findIndex(isSummaryCarrier);
-  const folded = sumIdx !== -1;
-  const freezeEnd = folded ? sumIdx : exit.length;
+  const folded = projection !== undefined || sumIdx !== -1;
+  const freezeEnd = projection !== undefined ? exit.length : folded ? sumIdx : exit.length;
   let foldStart = -1;
 
   // #4241 render-lane tail-fidelity: when THIS turn's outbound prefix was
@@ -331,7 +343,7 @@ export function judgeInboundOutbound(
         if (!eCarrier && isCarrier(x)) continue;
         scanned++;
         if (scanned > cap) break;
-        if (stableEqual(e, x)) { found = k; break; }
+        if (equal(e, x)) { found = k; break; }
         if (x.role === e.role && x.contentType === e.contentType && (!e.toolCallId || !x.toolCallId || x.toolCallId === e.toolCallId)) nearTwin = true;
       }
       if (found < 0) {
@@ -358,7 +370,7 @@ export function judgeInboundOutbound(
     for (let i = 0; i < entry.length; i++) {
       const e = entry[i];
       if (isReasoning(e)) continue;
-      if (folded && j >= freezeEnd) { foldStart = i; break; } // remainder is the folded region
+      if (projection === undefined && folded && j >= freezeEnd) { foldStart = i; break; } // remainder is the folded region
       total++;
 
       // Stateful hosts re-send previously-injected carriers in their inbound
@@ -376,7 +388,7 @@ export function judgeInboundOutbound(
         if (!eCarrier && isCarrier(x)) continue;
         scanned++;
         if (scanned > maxGap) break;
-        if (stableEqual(e, x)) { found = k; break; }
+        if (equal(e, x)) { found = k; break; }
         if (x.role === e.role && x.contentType === e.contentType && (!e.toolCallId || !x.toolCallId || x.toolCallId === e.toolCallId)) nearTwin = true;
       }
 
@@ -433,7 +445,7 @@ export function judgeInboundOutbound(
 
   // #4862 I3: egress pairing is exit-internal and fold-split agnostic — the
   // folded region stops being a free zone for protocol structure.
-  violations.push(...egressPairingViolations(entry, exit));
+  violations.push(...egressPairingViolations(pairingEntry, exit));
 
   return {
     ok: violations.length === 0,
@@ -455,6 +467,9 @@ export function judgeInboundOutbound(
 // never mutates the body or throws out. Owner design: #3842, enablement
 // decision recorded in #3938.
 interface InvariantJudgeInput {
+  /** Captured under the prepare lock, never supplied by the client or derived
+   *  from actual outbound bytes. */
+  expectedFoldedMessages?: readonly CoreMessage[];
   /** Inbound cores (what the client sent) — already computed by prepare. */
   originalMessages?: readonly CoreMessage[];
   /** Outbound request body (the exact bytes forwarded) — re-parsed to core here. */
@@ -541,7 +556,7 @@ export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
     const exitCores0 = parseExitCores(input.body, input.protocol, input.parsed);
     if (!exitCores0) return; // unparseable/unknown wire → skip, never false-positive
     const exitCores = fault ? fault([...exitCores0]) : exitCores0;
-    const v = judgeInboundOutbound(entry, exitCores, { renderTailStart: input.renderTailStart });
+    const v = judgeInboundOutbound(entry, exitCores, { renderTailStart: input.renderTailStart, expectedFoldedMessages: input.expectedFoldedMessages });
     // Every judged request reports its verdict (ok or not): consumers must be
     // able to see folded-but-clean traffic too, not just violations — that is
     // how the live I2 path proves a real fold stayed green (#3842).
