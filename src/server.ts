@@ -1932,6 +1932,8 @@ export type Prepared = {
     judgeBaseline?: readonly CoreMessage[];
     expectedFoldedMessages?: readonly CoreMessage[];
     expectedMediaMessages?: readonly CoreMessage[];
+    /** Snapshot boundary in expectedMediaMessages coordinates, captured under prepare's lock. */
+    expectedMediaRenderTailStart?: number;
     protocol: WireProtocol;
     stream: boolean;
     compressInjected: boolean;

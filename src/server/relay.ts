@@ -878,7 +878,8 @@ async function forwardCaptured(
         // (transcript rows + summary carriers), not the raw inbound bytes — the
         // judge must exempt that region and validate only the client tail. The
         // boundary was recorded by prepare's maybeSnapshotView on the same session.
-        const renderTailStart = typeof prepared.session.metadata["snapshotRenderTailStart"] === "number"
+        const renderTailStart = prepared.expectedMediaMessages !== undefined ? prepared.expectedMediaRenderTailStart
+            : typeof prepared.session.metadata["snapshotRenderTailStart"] === "number"
             ? (prepared.session.metadata["snapshotRenderTailStart"] as number)
             : undefined;
         maybeRunInvariantJudge({

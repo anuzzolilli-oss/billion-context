@@ -63,8 +63,9 @@ test("a tool result quoting the summary marker retains verified truncation handl
 });
 
 for (const role of ["user", "assistant"] as const) {
-    test(`ordinary ${role} text quoting a summary marker retains real truncation handling`, () => {
-        const paste: CoreMessage = { id: `paste-${role}`, role, contentType: "text", text: "PASTE-HEAD quoted [Compressed conversation section] " + "source ".repeat(1000) + " PASTE-TAIL" };
+  for (const prefix of ["PASTE-HEAD quoted ", "\n", "  ", "\n  "] ) {
+    test(`ordinary ${role} text quoting a summary marker after ${JSON.stringify(prefix)} retains real truncation handling`, () => {
+        const paste: CoreMessage = { id: `paste-${role}`, role, contentType: "text", text: prefix + "[Compressed conversation section] " + "source ".repeat(1000) + " PASTE-TAIL" };
         const expected = [summary, paste, recent];
         const clipped = truncateLargeToolOutputs(expected, 199000, defaultConfig(200000), defaultCountTokens,
             { includeTextMessages: true, minOutputTokens: 100, protectRecentMessages: 1, keepPrefixChars: 20, keepSuffixChars: 20 });
@@ -72,4 +73,5 @@ for (const role of ["user", "assistant"] as const) {
         assert.equal(judgeInboundOutbound(expected, clipped.messages, { expectedFoldedMessages: expected }).ok, true);
         assert.equal(judgeInboundOutbound(expected, clipped.messages.map(m => m.id === summary.id ? { ...m, text: "CORRUPTED SUMMARY" } : m), { expectedFoldedMessages: expected }).ok, false);
     });
+  }
 }

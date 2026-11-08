@@ -300,12 +300,12 @@ export function judgeInboundOutbound(
   if (imageProjection !== undefined) entry = imageProjection;
   const equal = (a: CoreMessage, b: CoreMessage): boolean => projection !== undefined
       && ((a.contentType === "text" && a.role !== "tool"
-          && (a.summaryOfBlockId !== undefined || a.id.startsWith("acp_summary_") || normText(a).startsWith(SUMMARY_MARKER)))
+          && (a.summaryOfBlockId !== undefined || a.id.startsWith("acp_summary_") || (a.text ?? "").startsWith(SUMMARY_MARKER)))
           || (a.contentType === "tool-call" && isCompressToolName(a.toolName)))
     ? a.role === b.role && a.contentType === b.contentType
       && (a.contentType !== "tool-call" || a.toolName === b.toolName)
       && (a.text ?? "").replace(RENDER_TAG_RE, "").trim() === (b.text ?? "").replace(RENDER_TAG_RE, "").trim()
-    : (!opts.imageArchiveBatches?.length || sameImage(a, b)) && stableEqual(a, b);
+    : ((opts.expectedMediaMessages === undefined && !opts.imageArchiveBatches?.length) || sameImage(a, b)) && stableEqual(a, b);
   const maxGap = opts.maxCarrierGap ?? 4;
   const maxExempt = opts.maxExempt ?? 128;
   const violations: Violation[] = [];

@@ -38,6 +38,7 @@ import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage, type RawStripCounts } from "../marker/engine.js";
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
 import { applyImageRescalePass } from "../image-rescale.js";
+import { projectOpenaiJudgeMedia } from "./judge-media-projection.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectOpenaiTool, injectTool } from "./inject.js";
@@ -656,15 +657,19 @@ export async function prepareOpenai(
     }
     let expectedFoldedMessages: CoreMessage[] | undefined;
     let expectedMediaMessages: CoreMessage[] | undefined;
+    let expectedMediaRenderTailStart: number | undefined;
     if (expectedFoldedView !== undefined) {
         const foldedView = [...expectedFoldedView, ...attachedRetrievals.map(item => item.injection)] as BiliMessage[];
         const imageView = await applyImageRescalePass(foldedView, { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
         expectedFoldedMessages = openaiToCore({ ...parsed, messages: coreToOpenai(systemToUser(imageView, isRenderedSummaryMessage)) }).msgs;
     } else if (invariantJudgeArmed() && (judgeBaseline ?? originalMessages).some(message => (message as BiliMessage).imagePart)) {
-        const imageView = await applyImageRescalePass([...(judgeBaseline ?? originalMessages)] as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
-        expectedMediaMessages = openaiToCore({ ...parsed, messages: coreToOpenai(systemToUser(imageView, isRenderedSummaryMessage)) }).msgs;
+        const projection = await projectOpenaiJudgeMedia((judgeBaseline ?? originalMessages) as BiliMessage[],
+            { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) },
+            typeof session.metadata["snapshotRenderTailStart"] === "number" ? session.metadata["snapshotRenderTailStart"] : undefined);
+        expectedMediaMessages = projection.messages;
+        expectedMediaRenderTailStart = projection.renderTailStart;
     }
-    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, expectedFoldedMessages, expectedMediaMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, expectedFoldedMessages, expectedMediaMessages, expectedMediaRenderTailStart, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 
 /** Append the ephemeral nudge to a Gemini `contents` array. Gemini is
