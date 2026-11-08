@@ -36,7 +36,7 @@ jobs:
             - name: Publish to npm with rolling pr tag
               # Repository secrets (NPM_TOKEN) are not available to workflows
               # triggered by fork PRs — publishing would fail with ENEEDAUTH (#670).
-              if: github.event.pull_request.head.repo.full_name == github.repository
+              if: github.repository == 'ranxianglei/billion-context' && github.event.pull_request.head.repo.full_name == github.repository
               id: publish
               run: |
                   PR_NUMBER="${{ github.event.pull_request.number }}"

@@ -12,7 +12,7 @@ import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
 import { markDirty } from "../session.js";
 import { buildForwardTarget, inboundResignCredential, resolveUpstream, type Prepared } from "../server.js";
 
-export interface BoundedMaintenanceOptions {
+interface BoundedMaintenanceOptions {
     timeoutMs?: number;
     maxTokens?: number;
 }
