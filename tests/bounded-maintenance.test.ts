@@ -70,7 +70,7 @@ async function scenario(enabled: boolean, mode = "success") {
     const opts = { ...loadOptions(), host: "127.0.0.1", port: 0, log: false, debug: false,
         routes: { [`http://127.0.0.1:${port}`]: { models: { "maintenance-fixture": { context: 64000 } } } },
         modelContextLimit: 64000, kernelConfig: defaultConfig(64000),
-        compress: { injectTool: true, injectNudge: true },
+        compress: { injectTool: true, injectNudge: true, ...(mode === "require-nudge" ? { requireNudge: true } : {}) },
         passthrough: false, autoUpdate: false, advisoryCheck: false, releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     };
@@ -219,6 +219,12 @@ test("opt-in runs one verified maintenance turn and forwards folded history with
     assert.ok(!JSON.stringify(result.mains[1]).includes("ARCHIVE-ORIGINAL-ONLY"));
     assert.ok(JSON.stringify(result.mains[1]).includes("LATEST-WORK-MUST-STAY"));
     assert.ok(JSON.stringify(result.mains[1]).includes("CEDAR"));
+});
+
+test("a newly delivered nudge arms maintenance using current-turn policy", async () => {
+    const result = await scenario(true, "require-nudge");
+    assert.equal(result.maintenance, 1);
+    assert.equal(result.blocks, 1, "the previous unnudged seed turn must not veto the fresh prompted fold");
 });
 
 test("request watchdog cancels maintenance and cannot commit after the 504", async () => {

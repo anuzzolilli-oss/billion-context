@@ -11,6 +11,7 @@ import { externalSummaryEnabled } from "../external-summary-surface.js";
 import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
 import { beginProvisionalUpstreamThrottle429, noteUpstreamThrottleResolved, releaseUpstreamThrottleProbe, throttle429ModelScope, upstreamThrottleGate } from "../upstream-throttle.js";
 import { markDirty } from "../session.js";
+import { unpromptedGateOf } from "../unprompted-gate.js";
 import { buildForwardTarget, inboundResignCredential, resolveUpstream, type Prepared } from "../server.js";
 
 interface BoundedMaintenanceOptions {
@@ -35,6 +36,7 @@ function bounded(value: number | undefined, fallback: number, max: number): numb
 }
 
 const MAX_ARCHIVE_BYTES = 32768;
+const MAX_ARCHIVE_PREVIEWS = 4;
 const MAX_MAINTENANCE_ATTEMPTS = 3;
 interface MaintenanceRetry { pending: boolean; attempts: number; nextAttemptAt: number }
 
@@ -63,7 +65,7 @@ function completeUnits(messages: BiliMessage[]): { start: number; end: number; m
         }
         else if (message.toolCallId && message.contentType === "tool-result") {
             const first = pairs.get(message.toolCallId);
-            if (first !== undefined) { ends[first] = Math.max(ends[first], index); pairs.delete(message.toolCallId); }
+            if (first !== undefined) ends[first] = Math.max(ends[first], index);
         }
     }
     const units: { start: number; end: number; messages: BiliMessage[]; ambiguous: boolean }[] = [];
@@ -91,8 +93,7 @@ function exactCoverage(prepared: Prepared, core: CompressionCore, config: Config
 }
 
 function archiveChunk(prepared: Prepared, core: CompressionCore, config: Config) {
-    let best: { originals: BiliMessage[]; source: string; startRef: string; endRef: string } | undefined;
-    let bestBytes = 0;
+    const candidates: { originals: BiliMessage[]; source: string; startRef: string; endRef: string; bytes: number }[] = [];
     const units = completeUnits(prepared.originalMessages as BiliMessage[]);
     const indexes = new Map(prepared.originalMessages.map((message, index) => [message.id, index]));
     const probeLength = Math.min(config.compress.maxSummaryLength > 0 ? config.compress.maxSummaryLength : Infinity, Math.max(64, config.compress.minSummaryLength));
@@ -110,11 +111,13 @@ function archiveChunk(prepared: Prepared, core: CompressionCore, config: Config)
         const keep = () => {
             const startRef = messages.length ? prepared.session.state.messageRefs.byRaw[messages[0].id] : undefined;
             const endRef = messages.length ? prepared.session.state.messageRefs.byRaw[messages[messages.length - 1].id] : undefined;
-            if (messages.length && bytes > bestBytes && startRef && endRef
-                && exactCoverage(prepared, core, config, messages, startRef, endRef, probe)) {
-                bestBytes = bytes;
-                best = { originals: messages, source: JSON.stringify(source),
-                    startRef, endRef };
+            const chars = messages.reduce((total, message) => total + (message.text?.length ?? 0), 0);
+            if (messages.length && startRef && endRef && chars >= config.compress.minCompressRange
+                && !candidates.some(candidate => candidate.startRef === startRef && candidate.endRef === endRef)
+                && (candidates.length < MAX_ARCHIVE_PREVIEWS || bytes > candidates[candidates.length - 1].bytes)) {
+                candidates.push({ originals: messages, source: JSON.stringify(source), startRef, endRef, bytes });
+                candidates.sort((a, b) => b.bytes - a.bytes);
+                if (candidates.length > MAX_ARCHIVE_PREVIEWS) candidates.pop();
             }
             messages = []; source = []; bytes = 2;
         };
@@ -138,7 +141,10 @@ function archiveChunk(prepared: Prepared, core: CompressionCore, config: Config)
         }
         keep();
     }
-    return best;
+    for (const candidate of candidates) {
+        if (exactCoverage(prepared, core, config, candidate.originals, candidate.startRef, candidate.endRef, probe)) return candidate;
+    }
+    return undefined;
 }
 
 async function readResponseText(response: Response): Promise<string> {
@@ -178,6 +184,8 @@ export async function maybeRunBoundedMaintenance(args: {
     if (!policy || signal.aborted || attemptedRequests.has(req) || prepared.protocol !== "openai" || !prepared.pluginMode
         || (!freshNudge && !retry?.pending)
         || externalSummaryEnabled(config)) return false;
+    const gate = unpromptedGateOf(session);
+    if (gate.requireNudge && (!gate.armed || prepared.nudgeOutcome !== "injected")) return false;
     if (retry?.pending && (Date.now() < retry.nextAttemptAt || (retry.attempts >= MAX_MAINTENANCE_ATTEMPTS && !freshNudge))) return false;
     const body = JSON.parse(typeof prepared.body === "string" ? prepared.body : prepared.body.toString()) as Record<string, unknown>;
     if (body.tool_choice === "none") return false;

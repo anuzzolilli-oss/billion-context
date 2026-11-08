@@ -2843,6 +2843,11 @@ async function handleRequest(
                     reqConfig = { ...reqConfig, modelContextLimit: overflowWindow };
                 }
                 prepared = await runPrepare();
+                storeUnpromptedGate(session, {
+                    armed: prepared.nudgeOutcome === "injected",
+                    requireNudge: preparedCs?.requireNudge === true,
+                    requireRecommendation: preparedCs?.requireRecommendation === true,
+                });
                 if (await maybeRunBoundedMaintenance({ prepared, req, opts, core, config: reqConfig, signal: decodingSignal, hopMarker: instanceId, log })) {
                     const requests = session.stats.requests;
                     try { prepared = withBoundedMaintenanceReceipt(await runPrepare()); }

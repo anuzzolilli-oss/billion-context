@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import test, { afterEach, beforeEach } from 'node:test';
+import test, { afterEach, beforeEach, mock } from 'node:test';
 import http from 'node:http';
 import { once } from 'node:events';
 import { Socket, type AddressInfo } from 'node:net';
@@ -10,6 +10,7 @@ import { SessionStore, _setStoreForTest } from '../src/persist.js';
 import { configureBoundedMaintenance, maybeRunBoundedMaintenance } from '../src/server/bounded-maintenance.js';
 import { startServer, stripKernelSummaries, type Prepared } from '../src/server.js';
 import { executeProxyToolAsync } from '../src/loop/core.js';
+import { storeUnpromptedGate } from '../src/unprompted-gate.js';
 import { _resetUpstreamThrottleForTest, activeThrottleHolds, noteUpstreamThrottle429, releaseUpstreamThrottleProbe, upstreamThrottleGate, upstreamThrottlePeekReject } from '../src/upstream-throttle.js';
 
 process.env.NODE_ENV = 'test';
@@ -436,3 +437,43 @@ for (const scope of ['credential', 'other-model', 'same-model'] as const) {
         assert.equal(activeThrottleHolds().length, 1, 'unrelated or blocked holds remain intact');
     });
 }
+
+test('repeated tool results stay with their call without swallowing a safe neighbor', async () => {
+    const messages: CoreMessage[] = [msg('safe', 'SAFE-NEIGHBOR '.repeat(450), 'user'),
+        { id: 'call', role: 'assistant', contentType: 'tool-call', toolName: 'read', toolCallId: 'echo', text: '{}' },
+        { id: 'result', role: 'tool', contentType: 'tool-result', toolName: 'read', toolCallId: 'echo', text: 'first result' },
+        { id: 'echo', role: 'tool', contentType: 'tool-result', toolName: 'read', toolCallId: 'echo', text: 'r'.repeat(40000) }, ...tail()];
+    const ctx = fixture(messages);
+    const result = await run(ctx, prepared(ctx, 0, 3));
+    assert.ok(result.applied);
+    assert.deepEqual(ctx.session.state.blocks[0].effectiveMessageIds, ['safe']);
+});
+
+for (const undersized of [true, false]) {
+    test(`selection bounds full-history previews for ${undersized ? 'undersized' : 'ineligible'} fragments`, async () => {
+        const messages = Array.from({ length: 40 }, (_, index) => [
+            msg(`fragment-${index}`, undersized ? '漢'.repeat(4000) : 'v'.repeat(6000), 'user'),
+            msg(`oversized-${index}`, 'o'.repeat(40000)),
+        ]).flat();
+        const ctx = fixture([...messages, ...tail()]);
+        if (!undersized) ctx.config.preserveRecentMessages = ctx.messages.length;
+        const apply = ctx.core.applyCompression.bind(ctx.core);
+        const spy = mock.method(ctx.core, 'applyCompression', apply);
+        try {
+            const result = await run(ctx, prepared(ctx, 0, messages.length - 1));
+            assert.equal(result.request, undefined);
+            assert.ok(spy.mock.callCount() <= (undersized ? 0 : 4), `full-history previews: ${spy.mock.callCount()}`);
+        } finally { spy.mock.restore(); }
+    });
+}
+
+for (const armed of [false, true]) test(`requireNudge defers an unprompted cooldown retry before generation: previous arm=${armed}`, async () => {
+    const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+    storeUnpromptedGate(ctx.session, { armed, requireNudge: true, requireRecommendation: false });
+    const retry = { pending: true, attempts: 1, nextAttemptAt: 0 };
+    ctx.session.metadata.boundedMaintenanceRetry = retry;
+    const p = prepared(ctx, 0, 0); p.nudgeOutcome = 'skipped';
+    const result = await run(ctx, p);
+    assert.equal(result.request, undefined);
+    assert.deepEqual(ctx.session.metadata.boundedMaintenanceRetry, retry);
+});
