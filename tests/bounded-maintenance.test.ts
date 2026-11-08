@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import test from "node:test";
+import test, { mock } from "node:test";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.js";
 import { loadOptions } from "../src/config.js";
@@ -14,6 +14,10 @@ process.env.NODE_ENV = "test";
 let scenarioId = 0;
 
 async function scenario(enabled: boolean, mode = "success") {
+    const retryMode = mode.startsWith("retry-");
+    let elapsed = 0;
+    const baseTime = Date.now();
+    const clock = retryMode ? mock.method(Date, "now", () => baseTime + elapsed) : undefined;
     let maintenance = 0;
     const maintenanceBodies: Record<string, unknown>[] = [];
     const mains: Record<string, unknown>[] = [];
@@ -28,7 +32,7 @@ async function scenario(enabled: boolean, mode = "success") {
             assert.equal(body.parallel_tool_calls, false);
             assert.equal(body.stream, false);
             if (mode === "http-error") { res.writeHead(503); res.end("UPSTREAM_SECRET"); return; }
-            if (mode === "timeout") { return; }
+            if (mode === "timeout" || (retryMode && (maintenance === 1 || mode === "retry-cap"))) { return; }
             res.writeHead(200, { "content-type": "application/json" });
             const span = /exactly (m\d+\u2013m\d+)/.exec(JSON.stringify(body))?.[1];
             assert.ok(span);
@@ -60,7 +64,7 @@ async function scenario(enabled: boolean, mode = "success") {
         passthrough: false, autoUpdate: false, advisoryCheck: false, releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     };
-    const proxy = await startServer(opts, enabled ? { boundedMaintenance: { timeoutMs: mode === "timeout" ? 25 : 15000 } } : undefined);
+    const proxy = await startServer(opts, enabled ? { boundedMaintenance: { timeoutMs: mode === "timeout" || retryMode ? 25 : 15000 } } : undefined);
     await once(proxy, "listening");
     const origin = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
     const headers: Record<string, string> = { "content-type": "application/json", "x-bili-plugin": "pi", "x-bili-plugin-conversation": "bounded-" + mode + enabled + "-" + ++scenarioId, "x-bili-plugin-context-window": "64000" };
@@ -111,13 +115,49 @@ async function scenario(enabled: boolean, mode = "success") {
         }
         else if (mode === "concurrent") await Promise.all([send(messages), send(messages)]);
         else await send(messages);
+        if (retryMode) {
+            assert.equal(maintenance, 1);
+            assert.equal(getSession(headers["x-bili-plugin-conversation"]).state.blocks.length, 0);
+            assert.ok(JSON.stringify(mains.at(-1)).includes("ARCHIVE-ORIGINAL-ONLY"));
+            await send(messages);
+            assert.equal(maintenance, 1, "No retry during cooldown");
+            elapsed += 30001;
+            if (mode === "retry-changed") messages[3] = { role: "assistant", content: "CHANGED ARCHIVE " + "replacement facts ".repeat(1300) };
+            await Promise.all([send(messages), send(messages)]);
+            assert.equal(maintenance, 2, "Exactly one retry after cooldown, even concurrently");
+            if (mode === "retry-cap") {
+                elapsed += 59999; await send(messages);
+                assert.equal(maintenance, 2, "Second retry has a longer cooldown");
+                elapsed += 2; await send(messages);
+                assert.equal(maintenance, 3);
+                elapsed += 120000; await send(messages);
+                assert.equal(maintenance, 3, "Exhausted budget cannot retry on every request");
+                messages[3] = { role: "assistant", content: "Changed after exhaustion " + "new archive ".repeat(1500) };
+                await send(messages);
+                assert.equal(maintenance, 3, "Changed archive alone cannot reset the budget");
+            } else {
+                assert.equal(getSession(headers["x-bili-plugin-conversation"]).state.blocks.length, 1);
+                if (mode === "retry-changed") assert.ok(!JSON.stringify(maintenanceBodies[1]).includes("ARCHIVE-ORIGINAL-ONLY"));
+                elapsed += 120000; await send(messages);
+                assert.equal(maintenance, 2, "Success closes the retry cycle");
+            }
+        }
         await send([...messages, { role: "assistant", content: "ACK" }, { role: "user", content: "continue again" }]);
         const session = getSession(headers["x-bili-plugin-conversation"]);
         return { maintenance, maintenanceBodies, mains, blocks: session.state.blocks.length, receipt: session.metadata.boundedMaintenanceLast as { blocksCreated?: number; outcome?: string; sourceBytes?: number; requestBytes?: number; requestedModel?: string; returnedModel?: string; requestedReasoningEffort?: string; inputTokens?: number; reasoningTokens?: number; failureKind?: string; httpStatus?: number; stage?: string; headersMs?: number } | undefined };
     } finally {
         proxy.closeAllConnections(); await new Promise<void>(r => proxy.close(() => r()));
         upstream.closeAllConnections(); await new Promise<void>(r => upstream.close(() => r()));
+        clock?.mock.restore();
     }
+}
+
+for (const mode of ["retry-recovery", "retry-cap", "retry-changed"]) {
+    test(`${mode}: induced timeout recovery is cooldown-bound and capped`, async () => {
+        const result = await scenario(true, mode);
+        assert.equal(result.maintenance, mode === "retry-cap" ? 3 : 2);
+        assert.equal(result.blocks, mode === "retry-cap" ? 0 : 1);
+    });
 }
 
 test("wired Pi native call echo stays clean across two folds and later requests", async () => {

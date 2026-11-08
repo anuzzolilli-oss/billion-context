@@ -32,6 +32,8 @@ function bounded(value: number | undefined, fallback: number, max: number): numb
 }
 
 const MAX_ARCHIVE_BYTES = 32768;
+const MAX_MAINTENANCE_ATTEMPTS = 3;
+interface MaintenanceRetry { pending: boolean; attempts: number; nextAttemptAt: number }
 
 function measuredIdentifier(value: unknown): string | undefined {
     return typeof value === "string" && /^[\w.:/\-]{1,160}$/.test(value) ? value : undefined;
@@ -103,9 +105,15 @@ export async function maybeRunBoundedMaintenance(args: {
 }): Promise<boolean> {
     const { prepared, req, opts, core, config, signal, log } = args;
     const policy = enabled.get(opts);
+    const session = prepared.session;
+    const saved = session.metadata.boundedMaintenanceRetry as MaintenanceRetry | undefined;
+    const retry = saved && typeof saved.pending === "boolean" && Number.isInteger(saved.attempts)
+        && saved.attempts >= 1 && saved.attempts <= MAX_MAINTENANCE_ATTEMPTS && Number.isFinite(saved.nextAttemptAt) ? saved : undefined;
+    const freshNudge = prepared.nudgeOutcome === "injected" && prepared.nudge?.tier === 1;
     if (!policy || signal.aborted || prepared.protocol !== "openai" || !prepared.pluginMode
-        || prepared.nudgeOutcome !== "injected" || prepared.nudge?.tier !== 1
+        || (!freshNudge && !retry?.pending)
         || externalSummaryEnabled(config)) return false;
+    if (retry?.pending && (Date.now() < retry.nextAttemptAt || (retry.attempts >= MAX_MAINTENANCE_ATTEMPTS && !freshNudge))) return false;
     const body = JSON.parse(typeof prepared.body === "string" ? prepared.body : prepared.body.toString()) as Record<string, unknown>;
     if (body.tool_choice === "none") return false;
     if (!Array.isArray(body.messages) || !Array.isArray(body.tools)) return false;
@@ -118,11 +126,12 @@ export async function maybeRunBoundedMaintenance(args: {
         start: range.startRef, end: range.endRef,
         originals,
     })).digest("hex");
-    const session = prepared.session;
-    if (session.metadata.boundedMaintenanceAttempt === signature) return false;
+    if (session.metadata.boundedMaintenanceAttempt === signature && !retry?.pending) return false;
     const target = buildForwardTarget(req, opts, resolveUpstream(opts, req.url ?? "", req));
     if (inboundResignCredential(req.headers, opts, target.upstreamUrl) !== undefined) return false;
     session.metadata.boundedMaintenanceAttempt = signature;
+    const attempt = retry?.pending && retry.attempts < MAX_MAINTENANCE_ATTEMPTS ? retry.attempts + 1 : 1;
+    session.metadata.boundedMaintenanceRetry = { pending: true, attempts: attempt, nextAttemptAt: Date.now() + (attempt === 1 ? 30000 : 60000) } satisfies MaintenanceRetry;
     markDirty(session);
     const span = `${range.startRef}\u2013${range.endRef}`;
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(bounded(policy.timeoutMs, 15000, 30000))]);
@@ -153,6 +162,7 @@ export async function maybeRunBoundedMaintenance(args: {
         requestedModel: measuredIdentifier(body.model), requestedReasoningEffort: "low", maxOutputTokens: maintenance.max_tokens,
         sourceBytes: Buffer.byteLength(range.source), sourceMessages: originals.length,
         startRef: range.startRef, endRef: range.endRef, requestBytes: Buffer.byteLength(payload),
+        attempt, trigger: attempt > 1 ? "retry" : "nudge",
     };
     try {
         const { response, clearTimer } = await fetchWithTimeout(target.upstreamUrl, {
@@ -199,13 +209,18 @@ export async function maybeRunBoundedMaintenance(args: {
     } catch (error) {
         failureKind = signal.aborted ? "client-abort" : deadline.aborted ? "deadline" : failureKind ?? stage;
         errorName = error instanceof Error ? measuredIdentifier(error.name) : undefined;
-        log("warn", `[${session.id}] [bounded-maintenance] failed; continuing original task without retry`);
+        log("warn", `[${session.id}] [bounded-maintenance] failed; continuing original task without an in-turn retry`);
         return session.state.blocks.some(b => !before.has(b.blockId));
     } finally {
+        const blocksCreated = session.state.blocks.filter(b => !before.has(b.blockId)).length;
+        session.metadata.boundedMaintenanceRetry = {
+            pending: blocksCreated === 0 && failureKind !== "client-abort",
+            attempts: attempt, nextAttemptAt: Date.now() + (attempt === 1 ? 30000 : 60000),
+        } satisfies MaintenanceRetry;
         session.metadata.boundedMaintenanceLast = {
             durationMs: Date.now() - started,
             outcome,
-            blocksCreated: session.state.blocks.filter(b => !before.has(b.blockId)).length,
+            blocksCreated,
             blockIds,
             ...measurement, stage, failureKind, errorName, httpStatus, headersMs, responseMs, returnedModel, finishReason,
             ...usage,
