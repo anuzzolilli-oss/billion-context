@@ -580,10 +580,13 @@ export async function prepareOpenai(
         });
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
-    const expectedFoldedMessages = pluginMode && judgeBaseline === undefined
-        && (processedMessages.some(isRenderedSummaryMessage) || session.state.blocks.some(block => block.active))
-        ? systemToUser(prune([...originalMessages], session.state), isRenderedSummaryMessage)
-        : undefined;
+    let expectedFoldedMessages: CoreMessage[] | undefined;
+    if (pluginMode && judgeBaseline === undefined
+        && (processedMessages.some(isRenderedSummaryMessage) || session.state.blocks.some(block => block.active))) {
+        const foldedView = prune([...originalMessages], session.state) as BiliMessage[];
+        const imageView = await applyImageRescalePass(foldedView, { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+        expectedFoldedMessages = openaiToCore({ ...parsed, messages: coreToOpenai(systemToUser(imageView, isRenderedSummaryMessage)) }).msgs;
+    }
     return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, expectedFoldedMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 

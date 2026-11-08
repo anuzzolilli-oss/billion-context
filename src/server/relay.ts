@@ -25,11 +25,12 @@ import { findRoute, resolveDeclaredProtocol, type ProxyOptions } from "../config
 import { makeContinuationRefetch } from "../degenerate-retry.js";
 import { dumpRejectedBody } from "../error-dump.js";
 import { extractWsOversizeError, formatMiB, shedEgressIfOverBudget, shedWireImages, shedWireImagesToCount, type ShedStats } from "../egress-shed.js";
+import type { ImageArchiveReceipt } from "../image-archive-receipt.js";
 import { conversationPromptSections, externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
 import { fakeBufCap, injectFakeCompletionHint, isFakeCompletion, maxFakeCompletionRetries } from "../fake-completion.js";
 import { fetchWithTimeout, fetchWithTransportRetry } from "../fetch-util.js";
 import { currentFetchTransport } from "../fetch-transport.js";
-import { refForItemBytes } from "../image-rescale.js";
+import { refForItemBytes, verifyArchivedImageSource } from "../image-rescale.js";
 import { countImagesInParsedBody, countImagesInRawBody, upstreamHost } from "../image-tokens.js";
 import { log as loggerLog } from "../logger.js";
 import { dumpReqAllowed as knobDumpReqAllowed, limitsWsOutboundBytes, rawDumpDir as knobRawDumpDir } from "../knobs.js";
@@ -566,8 +567,14 @@ async function forwardCaptured(
     // (no transport installed); managed non-WS transports pass through untouched
     // (#3701 Finding 1).
     let outboundCopyRewritten = false;
+    const imageArchiveBatches: ImageArchiveReceipt[][] = [];
     if (prepared && !prepared.sidePassthrough && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
-        const shed = await shedEgressIfOverBudget(wireBody, prepared.protocol, { sessionId: prepared.session.id, session: prepared.session, log, phase: "pre-send" });
+        const byteArchives: ImageArchiveReceipt[] = [];
+        const byteArchiveSession = prepared.session;
+        const shed = await shedEgressIfOverBudget(wireBody, prepared.protocol, { sessionId: prepared.session.id, session: prepared.session, log, phase: "pre-send", onImageArchive: async receipt => {
+            if (await verifyArchivedImageSource(byteArchiveSession, receipt)) byteArchives.push(receipt);
+        } });
+        if (byteArchives.length) imageArchiveBatches.push(byteArchives);
         if (shed.body !== wireBody) outboundCopyRewritten = true;
         wireBody = shed.body;
         // #4124: proactive per-prompt image-count cap — once this route PROVED a
@@ -579,9 +586,14 @@ async function forwardCaptured(
         const imgCap = imgOrigin !== undefined ? prepared.session.stats.imageCountCaps?.[imgOrigin] : undefined;
         if (typeof imgCap === "number" && imgCap > 0) {
             const sess = prepared.session;
+            const countArchives: ImageArchiveReceipt[] = [];
             const countShed = await shedWireImagesToCount(wireBody, prepared.protocol, imgCap - 1, {
                 resolveRef: (mt, b64) => refForItemBytes(sess, mt, b64),
+                onImageArchive: async receipt => {
+                    if (await verifyArchivedImageSource(sess, receipt)) countArchives.push(receipt);
+                },
             });
+            if (countArchives.length) imageArchiveBatches.push(countArchives);
             if (countShed.stats.changed) {
                 outboundCopyRewritten = true;
                 sess.metadata.imageCountShed = { at: Date.now(), phase: "pre-send", cap: imgCap, archived: countShed.stats.archived };
@@ -797,6 +809,7 @@ async function forwardCaptured(
             // prepared.originalMessages.
             originalMessages: prepared.judgeBaseline ?? prepared.originalMessages,
             expectedFoldedMessages: prepared.expectedFoldedMessages,
+            imageArchiveBatches,
             body: sentBody,
             protocol: prepared.protocol,
             sessionId: prepared.session.id,

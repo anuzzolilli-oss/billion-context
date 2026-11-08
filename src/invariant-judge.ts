@@ -48,6 +48,7 @@ import { openaiToCore, anthropicToCore, responsesToCore, googleToCore } from "ac
 import { log as loggerLog } from "./logger.js";
 import { invariantJudgeEnabled } from "./knobs.js";
 import { normalizeEchoArtifacts } from "./loop/tag-echo-filter.js";
+import { projectImageArchives, sameImage, type ImageArchiveReceipt } from "./image-archive-receipt.js";
 
 // `<acp tokens="N" type="T">ref</acp>`; angle brackets hex-escaped per KDD#2.
 // An optional leading newline is consumed too — the renderer injects the tag on
@@ -60,6 +61,7 @@ const SUMMARY_MARKER = "[Compressed conversation section]";
 const CRUSH_KEY = "__acp_crush";
 
 type ViolationKind =
+  | "unverified-image-archive"
   | "mid-history-rewrite"
   | "mid-history-drop"
   | "mid-insertion"
@@ -92,6 +94,7 @@ export interface JudgeVerdict {
 }
 
 interface JudgeOptions {
+  imageArchiveBatches?: readonly (readonly ImageArchiveReceipt[])[];
   /** Trusted kernel projection from recorded active folds; validate every
    *  surviving cell and the carrier, including cells preceding a tail anchor. */
   expectedFoldedMessages?: readonly CoreMessage[];
@@ -291,15 +294,18 @@ export function judgeInboundOutbound(
   const pairingEntry = entry;
   const projection = opts.expectedFoldedMessages;
   if (projection !== undefined) entry = projection;
+  const imageProjection = projectImageArchives(entry, opts.imageArchiveBatches ?? []);
+  if (imageProjection !== undefined) entry = imageProjection;
   const equal = (a: CoreMessage, b: CoreMessage): boolean => projection !== undefined
       && (isSummaryCarrier(a) || (a.contentType === "tool-call" && isCompressToolName(a.toolName)))
     ? a.role === b.role && a.contentType === b.contentType
       && (a.contentType !== "tool-call" || a.toolName === b.toolName)
       && (a.text ?? "").replace(RENDER_TAG_RE, "").trim() === (b.text ?? "").replace(RENDER_TAG_RE, "").trim()
-    : stableEqual(a, b);
+    : (!opts.imageArchiveBatches?.length || sameImage(a, b)) && stableEqual(a, b);
   const maxGap = opts.maxCarrierGap ?? 4;
   const maxExempt = opts.maxExempt ?? 128;
   const violations: Violation[] = [];
+  if (imageProjection === undefined) violations.push({ kind: "unverified-image-archive", index: -1, detail: "Image archive evidence does not match the expected media/position" });
   let matched = 0;
   let total = 0;
 
@@ -467,6 +473,7 @@ export function judgeInboundOutbound(
 // never mutates the body or throws out. Owner design: #3842, enablement
 // decision recorded in #3938.
 interface InvariantJudgeInput {
+  imageArchiveBatches?: readonly (readonly ImageArchiveReceipt[])[];
   /** Captured under the prepare lock, never supplied by the client or derived
    *  from actual outbound bytes. */
   expectedFoldedMessages?: readonly CoreMessage[];
@@ -556,7 +563,7 @@ export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
     const exitCores0 = parseExitCores(input.body, input.protocol, input.parsed);
     if (!exitCores0) return; // unparseable/unknown wire → skip, never false-positive
     const exitCores = fault ? fault([...exitCores0]) : exitCores0;
-    const v = judgeInboundOutbound(entry, exitCores, { renderTailStart: input.renderTailStart, expectedFoldedMessages: input.expectedFoldedMessages });
+    const v = judgeInboundOutbound(entry, exitCores, { renderTailStart: input.renderTailStart, expectedFoldedMessages: input.expectedFoldedMessages, imageArchiveBatches: input.imageArchiveBatches });
     // Every judged request reports its verdict (ok or not): consumers must be
     // able to see folded-but-clean traffic too, not just violations — that is
     // how the live I2 path proves a real fold stayed green (#3842).

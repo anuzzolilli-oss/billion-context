@@ -8,6 +8,7 @@
 
 billion-context/
 ├── src/
+│   ├── image-archive-receipt.ts  # Per-request OpenAI image archive evidence and media-aware expected-view projection
 │   ├── index.ts                  # Entry point: runs cli.ts main()
 │   ├── cli.ts                    # CLI dispatcher: start/update/export/test/plugin + client launcher
 │   ├── server.ts                 # HTTP proxy server, request pipeline (hot file — §7.2)
