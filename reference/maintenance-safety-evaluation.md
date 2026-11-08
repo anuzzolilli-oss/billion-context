@@ -66,3 +66,27 @@ node --import ./tests/preload-test-env.mjs --import tsx --test tests/bounded-mai
 ```
 
 The other six warnings in that review are outside this priority pass. No live deployment or persisted-cache migration is performed; merge acceptance still requires current review and remote CI results.
+
+## Remaining six warnings at 4dbc582d
+
+The next pass addresses all six warnings that Kilo retained at `4dbc582d`:
+
+| Concern | Repair and regression |
+| --- | --- |
+| Unbounded full-history selection previews | Candidate character minimums are checked without a kernel pass; only the four largest distinct candidates are retained. Selection performs at most four full-history previews, followed by the existing final pre-commit preview and normal execution for the chosen span. Forty subminimum fragments now require zero previews, while forty ineligible candidates require at most four. |
+| Stale current-turn policy | Current delivery/policy facts are stamped before maintenance and again after rebuilding. `requireNudge` rejects an unprompted cooldown retry before generation even if an old arm was true; the pending attempt budget is unchanged. A transition from an unnudged seed to a fresh nudge successfully folds. |
+| Repeated tool results | Every result retains its association with the current call until a new call of that ID. An oversized re-echo remains outside the fold while independent neighboring text can still fold; reused-call ambiguity safeguards remain active. |
+| Configured carrier relocation | Independent expected projection invokes the same configured deterministic relocation after consumed-call cleanup. Native and MCP alias tests exercise a real relocated fold, both thinking configurations, and later requests. Existing two-fold native/MCP tests remain. |
+| Quoted summary markers in ordinary prose | Strict projected-summary checks require structural identity or a header-anchored summary. Real emergency truncations of ordinary user/assistant prose quoting the marker in its middle pass; actual summary corruption remains a violation. |
+| Preparation-plus-relay resizing | Preparation supplies a separate trusted expected-media view when no folded projection is available. Relay resize receipts validate against intermediate pixels, without claiming the request folded. A real 1900×1050 PNG is resized in preparation and again at egress; clean traffic passes, and altered pixels still fail. Disabled diagnostics avoid constructing the additional media view. |
+
+Selection is deliberately best effort: if the bounded candidate set fails authoritative kernel checks, maintenance defers instead of scanning an unbounded number of alternatives or relaxing coverage. The four-preview bound concerns selection; final validation and actual compression still execute their normal checks. No wall-clock latency improvement is inferred from these operation-count tests.
+
+The isolated targeted run passed **169 tests**. A separate policy/fold-point/image-rescale compatibility run passed **46 tests**, for **215 distinct passing tests**, no failures or skips. Typecheck, build and the unused-export gate passed. Commands:
+
+```sh
+node --import ./tests/preload-test-env.mjs --import tsx --test tests/bounded-maintenance-safety.test.ts tests/bounded-maintenance.test.ts tests/native-call-carrier-e2e.test.ts tests/native-fold-invariant.test.ts tests/image-archive-judge.test.ts tests/image-archive-relay.test.ts tests/invariant-judge.test.ts tests/issue4204-throttle-governor.test.ts tests/fix-806-request-watchdog.test.ts
+node --import ./tests/preload-test-env.mjs --import tsx --test tests/issue5683-forbid-unprompted-compress.test.ts tests/compress-at-fold-point.test.ts tests/issue3400-image-rescale.test.ts
+```
+
+These are local checks against fake loopback services and generated images, not a full CI verdict or a live deployment. Existing persisted caches are not migrated. The latest CI and Kilo review must be assessed on the delivered head. PR #1 was already open and unmerged, so the changes preserve its branch and review history.

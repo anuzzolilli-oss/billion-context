@@ -1,6 +1,6 @@
 import http from "node:http";
 import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
-import { hideConsumedCompressCalls, hideAbsorbedMessages, isRenderedSummaryMessage, prune, renderNudgeText, viableRanges } from "acp-kernel";
+import { hideConsumedCompressCalls, hideAbsorbedMessages, isRenderedSummaryMessage, prune, relocateCompressCarriers, renderNudgeText, viableRanges } from "acp-kernel";
 import { coreToOpenai, injectOpenaiSystem, openaiToCore, type BiliMessage, type OpenAIRequestBody, type OpenAITool } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
@@ -30,6 +30,7 @@ import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSum
 import { filterDeadRanges } from "../dead-ranges.js";
 import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
+import { invariantJudgeArmed } from "../invariant-judge.js";
 import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js";
 import { dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning } from "../strict-echo.js";
@@ -392,10 +393,14 @@ export async function prepareOpenai(
         });
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
         processedMessages = applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId);
-        if (pluginMode && judgeBaseline === undefined && turn.state.blocks.some(block => block.active)) {
+        if (invariantJudgeArmed() && pluginMode && judgeBaseline === undefined && turn.state.blocks.some(block => block.active)) {
             const pruned = prune([...originalMessages], turn.state, { isCompressTool: loopConfig.isCompressTool });
             const hidden = hideConsumedCompressCalls(turn.state, pruned, loopConfig.isCompressTool).messages;
-            const absorbed = applyAbsorbView(hideAbsorbedMessages(hidden, turn.state), turn.state, loopConfig, tokenCount);
+            const relocated = loopConfig.compressAtFoldPoint ? relocateCompressCarriers(hidden, turn.state, {
+                isCompressTool: loopConfig.isCompressTool, clearThinking: loopConfig.compressAtFoldPointClearThinking === true,
+                reasoningDroppable: loopConfig.reasoningDroppable,
+            }) : hidden;
+            const absorbed = applyAbsorbView(hideAbsorbedMessages(relocated, turn.state), turn.state, loopConfig, tokenCount);
             const decorated = attachSubagentSessions(absorbed, session);
             expectedFoldedView = applyReasoningDrop(stripKernelSummaries(decorated, turn.state), reasoningPlan, log, sessionId) as BiliMessage[];
         }
@@ -650,12 +655,16 @@ export async function prepareOpenai(
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
     let expectedFoldedMessages: CoreMessage[] | undefined;
+    let expectedMediaMessages: CoreMessage[] | undefined;
     if (expectedFoldedView !== undefined) {
         const foldedView = [...expectedFoldedView, ...attachedRetrievals.map(item => item.injection)] as BiliMessage[];
         const imageView = await applyImageRescalePass(foldedView, { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
         expectedFoldedMessages = openaiToCore({ ...parsed, messages: coreToOpenai(systemToUser(imageView, isRenderedSummaryMessage)) }).msgs;
+    } else if (invariantJudgeArmed() && (judgeBaseline ?? originalMessages).some(message => (message as BiliMessage).imagePart)) {
+        const imageView = await applyImageRescalePass([...(judgeBaseline ?? originalMessages)] as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+        expectedMediaMessages = openaiToCore({ ...parsed, messages: coreToOpenai(systemToUser(imageView, isRenderedSummaryMessage)) }).msgs;
     }
-    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, expectedFoldedMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, expectedFoldedMessages, expectedMediaMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 
 /** Append the ephemeral nudge to a Gemini `contents` array. Gemini is

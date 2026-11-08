@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { CoreMessage } from "acp-kernel";
+import { defaultConfig, defaultCountTokens, truncateLargeToolOutputs } from "acp-kernel";
 import { judgeInboundOutbound } from "../src/invariant-judge.js";
 
 const old: CoreMessage = { id: "old", role: "assistant", contentType: "text", text: "consumed original" };
@@ -60,3 +61,15 @@ test("a tool result quoting the summary marker retains verified truncation handl
     assert.equal(judgeInboundOutbound(expected, [summary, call, clipped, recent], { expectedFoldedMessages: expected }).ok, true);
     assert.equal(judgeInboundOutbound(expected, [summary, call, { ...clipped, text: "CORRUPTED" }, recent], { expectedFoldedMessages: expected }).ok, false);
 });
+
+for (const role of ["user", "assistant"] as const) {
+    test(`ordinary ${role} text quoting a summary marker retains real truncation handling`, () => {
+        const paste: CoreMessage = { id: `paste-${role}`, role, contentType: "text", text: "PASTE-HEAD quoted [Compressed conversation section] " + "source ".repeat(1000) + " PASTE-TAIL" };
+        const expected = [summary, paste, recent];
+        const clipped = truncateLargeToolOutputs(expected, 199000, defaultConfig(200000), defaultCountTokens,
+            { includeTextMessages: true, minOutputTokens: 100, protectRecentMessages: 1, keepPrefixChars: 20, keepSuffixChars: 20 });
+        assert.equal(clipped.truncatedCount, 1);
+        assert.equal(judgeInboundOutbound(expected, clipped.messages, { expectedFoldedMessages: expected }).ok, true);
+        assert.equal(judgeInboundOutbound(expected, clipped.messages.map(m => m.id === summary.id ? { ...m, text: "CORRUPTED SUMMARY" } : m), { expectedFoldedMessages: expected }).ok, false);
+    });
+}

@@ -94,6 +94,7 @@ export interface JudgeVerdict {
 }
 
 interface JudgeOptions {
+  expectedMediaMessages?: readonly CoreMessage[];
   imageArchiveBatches?: readonly (readonly ImageTransformReceipt[])[];
   /** Trusted kernel projection from recorded active folds; validate every
    *  surviving cell and the carrier, including cells preceding a tail anchor. */
@@ -294,10 +295,13 @@ export function judgeInboundOutbound(
   const pairingEntry = entry;
   const projection = opts.expectedFoldedMessages;
   if (projection !== undefined) entry = projection;
+  else if (opts.expectedMediaMessages !== undefined) entry = opts.expectedMediaMessages;
   const imageProjection = projectImageArchives(entry, opts.imageArchiveBatches ?? []);
   if (imageProjection !== undefined) entry = imageProjection;
   const equal = (a: CoreMessage, b: CoreMessage): boolean => projection !== undefined
-      && ((a.contentType === "text" && a.role !== "tool" && isSummaryCarrier(a)) || (a.contentType === "tool-call" && isCompressToolName(a.toolName)))
+      && ((a.contentType === "text" && a.role !== "tool"
+          && (a.summaryOfBlockId !== undefined || a.id.startsWith("acp_summary_") || normText(a).startsWith(SUMMARY_MARKER)))
+          || (a.contentType === "tool-call" && isCompressToolName(a.toolName)))
     ? a.role === b.role && a.contentType === b.contentType
       && (a.contentType !== "tool-call" || a.toolName === b.toolName)
       && (a.text ?? "").replace(RENDER_TAG_RE, "").trim() === (b.text ?? "").replace(RENDER_TAG_RE, "").trim()
@@ -473,6 +477,7 @@ export function judgeInboundOutbound(
 // never mutates the body or throws out. Owner design: #3842, enablement
 // decision recorded in #3938.
 interface InvariantJudgeInput {
+  expectedMediaMessages?: readonly CoreMessage[];
   imageArchiveBatches?: readonly (readonly ImageTransformReceipt[])[];
   /** Captured under the prepare lock, never supplied by the client or derived
    *  from actual outbound bytes. */
@@ -563,7 +568,7 @@ export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
     const exitCores0 = parseExitCores(input.body, input.protocol, input.parsed);
     if (!exitCores0) return; // unparseable/unknown wire → skip, never false-positive
     const exitCores = fault ? fault([...exitCores0]) : exitCores0;
-    const v = judgeInboundOutbound(entry, exitCores, { renderTailStart: input.renderTailStart, expectedFoldedMessages: input.expectedFoldedMessages, imageArchiveBatches: input.imageArchiveBatches });
+    const v = judgeInboundOutbound(entry, exitCores, { renderTailStart: input.renderTailStart, expectedFoldedMessages: input.expectedFoldedMessages, expectedMediaMessages: input.expectedMediaMessages, imageArchiveBatches: input.imageArchiveBatches });
     // Every judged request reports its verdict (ok or not): consumers must be
     // able to see folded-but-clean traffic too, not just violations — that is
     // how the live I2 path proves a real fold stayed green (#3842).

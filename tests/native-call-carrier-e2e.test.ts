@@ -11,7 +11,7 @@ import { getSession } from "../src/session.js";
 import { _setInvariantJudgeForTest, _setInvariantJudgeFaultForTest, type JudgeVerdict } from "../src/invariant-judge.js";
 
 let sequence = 0;
-async function nativeEcho(decorated = false, mcp = false) {
+async function nativeEcho(decorated = false, mcp = false, relocate = false, clearThinking = false) {
     const upstream = http.createServer(async (req, res) => {
         for await (const _chunk of req) { /* Drain the disposable request. */ }
         res.writeHead(200, { "content-type": "application/json" });
@@ -22,8 +22,8 @@ async function nativeEcho(decorated = false, mcp = false) {
     _setStoreForTest(new SessionStore({ enabled: false })); setRegistryForTest({});
     const proxy = await startServer({ ...loadOptions(), host: "127.0.0.1", port: 0,
         routes: { [target]: { models: { "native-fixture": { context: 200000 } } } },
-        modelContextLimit: 200000, kernelConfig: defaultConfig(200000),
-        compress: { injectTool: true, injectNudge: false }, passthrough: false,
+        modelContextLimit: 200000, kernelConfig: defaultConfig(200000, { isCompressTool: name => name === "compress" || name === "mcp__bili__compress" }),
+        compress: { injectTool: true, injectNudge: false, compressAtFoldPoint: relocate, compressAtFoldPointClearThinking: clearThinking }, passthrough: false,
         autoUpdate: false, advisoryCheck: false, releaseNotesCheck: false, log: false, debug: false,
         mitm: { enabled: false, domains: [] },
     });
@@ -32,7 +32,7 @@ async function nativeEcho(decorated = false, mcp = false) {
     const cid = `native-carrier-${++sequence}`;
     const messages: unknown[] = [{ role: "user", content: "Read the disposable history." }];
     for (let i = 0; i < 30; i++) messages.push(
-        { role: "assistant", content: null, tool_calls: [{ id: `read-${i}`, type: "function", function: { name: "read_fixture", arguments: "{}" } }] },
+        { role: "assistant", content: null, ...(relocate ? { reasoning_content: `Disposable reasoning ${i}` } : {}), tool_calls: [{ id: `read-${i}`, type: "function", function: { name: "read_fixture", arguments: "{}" } }] },
         { role: "tool", tool_call_id: `read-${i}`, content: `Observation ${i}: ` + "consumed scenery ".repeat(100) },
     );
     messages.push({ role: "user", content: "PROTECTED-WORK: preserve current requirements." });
@@ -52,14 +52,15 @@ async function nativeEcho(decorated = false, mcp = false) {
     };
     try {
         await send();
-        for (let fold = 0; fold < 2; fold++) {
+        for (let fold = 0; fold < (relocate ? 1 : 2); fold++) {
             if (fold) {
                 messages.push({ role: "assistant", content: "SECOND ARCHIVE " + "consumed second fixture ".repeat(1200) }, { role: "user", content: "PROTECTED-WORK: second current request." });
                 await send();
             }
             const status = await invoke("acp_status", {});
-            const spans = [...status.result.matchAll(/(m\d+)[–-](m\d+)\s+\d+ msgs/g)];
-            const span = fold ? spans.at(-1) : spans[0];
+            const spans = [...status.result.matchAll(/(m\d+)[–-](m\d+)\s+\d+ msgs\s+([\d.]+)([KM]?)/g)];
+            const mass = (span: RegExpMatchArray) => Number(span[3]) * (span[4] === "M" ? 1000000 : span[4] === "K" ? 1000 : 1);
+            const span = spans.sort((a, b) => mass(b) - mass(a))[0];
             assert.ok(span, status.result);
             const args = { content: `${span[1]}–${span[2]} Archived fixture\nConsumed scenery observations; originals remain retrievable. No open task requirements within this range.` };
             const id = `compress-${fold}`;
@@ -97,6 +98,18 @@ test("MCP compression carriers and consumed calls remain clean across two folds"
         assert.ok(verdicts.every(v => v.ok), JSON.stringify(verdicts.filter(v => !v.ok)));
     } finally { _setInvariantJudgeForTest(true); }
 });
+
+for (const mcp of [false, true]) for (const clear of [false, true]) {
+    test(`configured carrier relocation remains clean: MCP=${mcp}, clearThinking=${clear}`, async () => {
+        const verdicts: JudgeVerdict[] = [];
+        _setInvariantJudgeForTest(true, verdict => verdicts.push(verdict));
+        try {
+            await nativeEcho(false, mcp, true, clear);
+            assert.ok(verdicts.some(v => v.folded));
+            assert.ok(verdicts.every(v => v.ok), JSON.stringify(verdicts.filter(v => !v.ok)));
+        } finally { _setInvariantJudgeForTest(true); }
+    });
+}
 
 for (const fault of ["none", "summary", "protected"] as const) {
     test(`native Pi call/result echo across two folds: ${fault}`, async () => {

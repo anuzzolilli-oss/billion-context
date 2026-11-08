@@ -1931,6 +1931,7 @@ export type Prepared = {
      *  judge keeps originalMessages (byte-identical behavior). */
     judgeBaseline?: readonly CoreMessage[];
     expectedFoldedMessages?: readonly CoreMessage[];
+    expectedMediaMessages?: readonly CoreMessage[];
     protocol: WireProtocol;
     stream: boolean;
     compressInjected: boolean;

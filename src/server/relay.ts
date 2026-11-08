@@ -895,6 +895,7 @@ async function forwardCaptured(
             // prepared.originalMessages.
             originalMessages: prepared.judgeBaseline ?? prepared.originalMessages,
             expectedFoldedMessages: prepared.expectedFoldedMessages,
+            expectedMediaMessages: prepared.expectedMediaMessages,
             imageArchiveBatches,
             body: sentBody,
             protocol: prepared.protocol,
