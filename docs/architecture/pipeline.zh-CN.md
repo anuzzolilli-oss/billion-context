@@ -21,6 +21,8 @@
 
 **准备（按 wire）。** `prepare-anthropic` / `prepare-openai` / `prepare-responses` / `prepare-google` 把请求转成 canonical cores（宿主 msgid 等 in-flight 信封字段在此剥掉——见 [identity](./identity.zh-CN.md)），跑折叠→重建→注入，把 system 与 nudge 落到该 wire 要求的位置。
 
+**历史诊断（OpenAI 媒体）。** 启用检查时，`judge-media-projection.ts` 在准备锁内独立构造预期媒体字节。快照尾部边界经过缩图和 wire 合并后重新定位；跨越边界的 wire 消息整体纳入检查。Relay 将捕获的预期视图、边界和可信图片变换凭据交给 `invariant-judge.ts`。服务端渲染前缀豁免尾部保真检查，但修改实时文本或像素仍会失败。预期字节不从实际出站包推导，此诊断路径也不改写出站包。
+
 **内核。** canonical cores 加会话的 `CompressionState` 进 acp-kernel，判定与产物回来——见 [kernel 模块](./kernel.zh-CN.md)。
 
 **统一 loop（`src/loop`）。** 协议中立核心 + 4 个 wire 适配器，做工具裁决与散文 tag-echo 过滤（`tag-echo-filter.ts`——只滤散文、参数不动）。两种压缩模式在这里共用同一条代码路径（KDD #7）：plugin 模式抑制 tool + nudge 注入（agent 自己压）；proxy 模式发 `acp_summary` 载体、改口为 user 消息，让严格后端保持前缀稳定。

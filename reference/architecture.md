@@ -28,6 +28,7 @@ billion-context/
 │   │   ├── prepare-anthropic.ts  #   Anthropic request preparation (fold → rebuild → system/nudge injection) (#1440)
 │   │   ├── prepare-google.ts     #   Gemini request preparation incl. :countTokens twin (#1440)
 │   │   ├── prepare-openai.ts     #   OpenAI chat request preparation (#1440)
+│   │   ├── judge-media-projection.ts # Independent expected media view + snapshot seam mapping
 │   │   ├── prepare-responses.ts  #   Responses request preparation + codex compact/prompt-cache helpers (#1440)
 │   │   ├── relay.ts             #   Upstream relay zone: forward() + fake-completion recovery (#1440 P2 cut 4)
 │   │   ├── side-request.ts       #   Tool-surface check for auxiliary side requests
