@@ -17,8 +17,9 @@ async function scenario(enabled: boolean, mode = "success") {
     const retryMode = mode.startsWith("retry-");
     let elapsed = 0;
     const baseTime = Date.now();
-    const clock = retryMode ? mock.method(Date, "now", () => baseTime + elapsed) : undefined;
+    const clock = retryMode || mode === "overflow-watchdog" ? mock.method(Date, "now", () => baseTime + elapsed) : undefined;
     let maintenance = 0;
+    let maintenanceAborted = 0;
     const maintenanceBodies: Record<string, unknown>[] = [];
     const mains: Record<string, unknown>[] = [];
     const upstream = http.createServer(async (req, res) => {
@@ -27,13 +28,14 @@ async function scenario(enabled: boolean, mode = "success") {
         const body = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
         if (typeof body.tool_choice === "object" && body.tool_choice !== null) {
             maintenance++;
+            res.on("close", () => { if (!res.writableEnded) maintenanceAborted++; });
             maintenanceBodies.push(body);
             assert.equal((body.tools as unknown[]).length, 1);
             assert.equal(body.parallel_tool_calls, false);
             assert.equal(body.stream, false);
             if (mode === "http-error") { res.writeHead(503); res.end("UPSTREAM_SECRET"); return; }
             if (mode === "timeout" || (retryMode && (maintenance === 1 || mode === "retry-cap"))) { return; }
-            if (mode === "watchdog") await new Promise(resolve => setTimeout(resolve, 180));
+            if (mode === "watchdog" || mode === "overflow-watchdog") await new Promise(resolve => setTimeout(resolve, mode === "overflow-watchdog" ? 1000 : 180));
             res.writeHead(200, { "content-type": "application/json" });
             const span = /exactly (m\d+\u2013m\d+)/.exec(JSON.stringify(body))?.[1];
             assert.ok(span);
@@ -50,6 +52,13 @@ async function scenario(enabled: boolean, mode = "success") {
             }
             res.end(JSON.stringify({ model: "measured-fixture", usage: { prompt_tokens: 8123, completion_tokens: 201, completion_tokens_details: { reasoning_tokens: 17 } }, choices: [{ message, finish_reason: mode === "truncated" ? "length" : "tool_calls" }] }));
         } else {
+            if (mode === "overflow-watchdog" && mains.length === 1) {
+                mains.push(body);
+                elapsed += 30001;
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: { code: "context_length_exceeded", message: "This model's maximum context length is 32000 tokens. However, you requested 50000 tokens." } }));
+                return;
+            }
             res.writeHead(200, { "content-type": "application/json" });
             mains.push(body);
             res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: "ACK" }, finish_reason: "stop" }], usage: { prompt_tokens: 50000, completion_tokens: 1 } }));
@@ -75,15 +84,17 @@ async function scenario(enabled: boolean, mode = "success") {
         { type: "function", function: { name: "compress", description: "Compress consumed context", parameters: { type: "object", properties: { content: { type: "string" } } } } },
     ];
     const send = async (messages: unknown[]) => {
-        if (mode === "watchdog" && messages.length > 1) _setRequestWatchdogDelayForTest(40);
+        const watchdogTurn = (mode === "watchdog" || mode === "overflow-watchdog") && messages.length > 1;
+        if (watchdogTurn) _setRequestWatchdogDelayForTest(mode === "overflow-watchdog" ? 400 : 80);
         const r = await fetch(`${origin}/bili/http://127.0.0.1:${port}/v1/chat/completions`, { method: "POST", headers, body: JSON.stringify({ model: "maintenance-fixture", max_tokens: 2048, messages, tools: mode === "no-compress-tool" ? tools.slice(0, 1) : tools, tool_choice: mode === "tool-none" ? "none" : "auto", stream: false }) });
-        assert.equal(r.status, mode === "watchdog" && messages.length > 1 ? 504 : 200); await r.text();
+        assert.equal(r.status, watchdogTurn ? 504 : 200); await r.text();
     };
     try {
         const old = "Project CEDAR; owner Nia; budget 4826 credits; deadline 2026-12-23. ARCHIVE-ORIGINAL-ONLY. " + "old scenery ".repeat(1800);
         const toolFirst = mode === "tool-first";
         const seed = toolFirst ? [{ role: "assistant", content: null, tool_calls: [{ id: "first-read", type: "function", function: { name: "read_fixture", arguments: "{}" } }] }, { role: "tool", tool_call_id: "first-read", content: old }, { role: "user", content: "inspect fixture" }] : [{ role: "user", content: "hello" }];
         await send(seed);
+        if (mode === "overflow-watchdog") getSession(headers["x-bili-plugin-conversation"]).metadata.boundedMaintenanceRetry = { pending: true, attempts: 1, nextAttemptAt: baseTime + 30000 };
         const messages: unknown[] = toolFirst ? [...seed, { role: "assistant", content: "ACK" }] : [{ role: "user", content: "hello" }, { role: "assistant", content: "ACK" }, { role: "user", content: "inspect fixture" }, { role: "assistant", content: old }];
         for (let i = 0; i < 12; i++) messages.push({ role: "user", content: mode === "chunked" ? "漢字🙂".repeat(350) : "u".repeat(1000) }, { role: "assistant", content: "a".repeat(1000) });
         if (mode === "chunked") messages.push({ role: "assistant", content: "ARCHIVE-UNSELECTED-MUST-STAY " + "later archive ".repeat(2000) });
@@ -117,10 +128,10 @@ async function scenario(enabled: boolean, mode = "success") {
         }
         else if (mode === "concurrent") await Promise.all([send(messages), send(messages)]);
         else await send(messages);
-        if (mode === "watchdog") {
-            await new Promise(resolve => setTimeout(resolve, 250));
+        if (mode === "watchdog" || mode === "overflow-watchdog") {
+            await new Promise(resolve => setTimeout(resolve, mode === "overflow-watchdog" ? 1250 : 250));
             const session = getSession(headers["x-bili-plugin-conversation"]);
-            return { maintenance, maintenanceBodies, mains, blocks: session.state.blocks.length, requests: session.stats.requests, receipt: undefined };
+            return { maintenance, maintenanceAborted, inFlight: session.inFlight, maintenanceBodies, mains, blocks: session.state.blocks.length, requests: session.stats.requests, receipt: undefined };
         }
         if (retryMode) {
             assert.equal(maintenance, 1);
@@ -151,7 +162,7 @@ async function scenario(enabled: boolean, mode = "success") {
         }
         await send([...messages, { role: "assistant", content: "ACK" }, { role: "user", content: "continue again" }]);
         const session = getSession(headers["x-bili-plugin-conversation"]);
-        return { maintenance, maintenanceBodies, mains, blocks: session.state.blocks.length, requests: session.stats.requests, receipt: session.metadata.boundedMaintenanceLast as { blocksCreated?: number; outcome?: string; sourceBytes?: number; requestBytes?: number; requestedModel?: string; returnedModel?: string; requestedReasoningEffort?: string; inputTokens?: number; reasoningTokens?: number; failureKind?: string; httpStatus?: number; stage?: string; headersMs?: number } | undefined };
+        return { maintenance, maintenanceAborted, inFlight: session.inFlight, maintenanceBodies, mains, blocks: session.state.blocks.length, requests: session.stats.requests, receipt: session.metadata.boundedMaintenanceLast as { blocksCreated?: number; outcome?: string; sourceBytes?: number; requestBytes?: number; requestedModel?: string; returnedModel?: string; requestedReasoningEffort?: string; inputTokens?: number; reasoningTokens?: number; failureKind?: string; httpStatus?: number; stage?: string; headersMs?: number } | undefined };
     } finally {
         proxy.closeAllConnections(); await new Promise<void>(r => proxy.close(() => r()));
         upstream.closeAllConnections(); await new Promise<void>(r => upstream.close(() => r()));
@@ -215,6 +226,15 @@ test("request watchdog cancels maintenance and cannot commit after the 504", asy
     assert.equal(result.maintenance, 1);
     assert.equal(result.blocks, 0);
     assert.equal(result.mains.length, 1, "only the initial seed request reached the ordinary upstream");
+});
+
+test("overflow recovery maintenance remains cancelled by the request watchdog after relay registration", async () => {
+    const result = await scenario(true, "overflow-watchdog");
+    assert.equal(result.maintenance, 1, "maintenance was skipped initially and first attempted in overflow recovery");
+    assert.equal(result.mains.length, 2, "the initial ordinary request reached the relay and returned overflow");
+    assert.equal(result.blocks, 0, "the delayed maintenance response must not commit after the watchdog 504");
+    assert.equal(result.maintenanceAborted, 1, "the upstream maintenance fetch was actually cancelled");
+    assert.equal(result.inFlight, 0, "request ownership is released instead of waiting for the maintenance deadline");
 });
 
 test("default startup never runs hidden maintenance", async () => {
