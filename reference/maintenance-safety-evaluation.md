@@ -50,3 +50,19 @@ The branch incorporates fork master `3ac3e95c` through a merge commit, retaining
 Additional follow-up edges: unlimited summary length keeps a nonempty selection probe; final coverage preview retains `summaryMaxChars`; reused call IDs are treated as ambiguous without swallowing safe neighbors; reasoning groups include later assistant companions; binary search limits unit traversal to each resolved range. Original bytes now have a dedicated cache input, preserving the processed live view for shrink-ratio metrics. Post-fold tests assert successful second-block creation, full cache preservation, complete call/result IDs and the live-view shrink denominator.
 
 Follow-up validation: **141 focused tests passed**, no failures or skips; typecheck and build passed. The broader run completed **162 tests: 154 passed, 8 failed**, all eight during Windows EPERM temporary-directory teardown in `issue1086-chain-self-exemption.test.ts`. One identical case was independently reproduced at unchanged fork master `3ac3e95c`. The focused run excludes that suite; no test assertions or cleanup policy were weakened. This is not a fully green broad-suite or remote CI verdict. Results are retained with the PR and the local follow-up report.
+
+## Priority pass: overflow watchdog and rate-limit accounting
+
+The review at `b2eaf2a2` identified a narrower watchdog gap: maintenance skipped during cooldown could become eligible after a delayed overflow response. Relay registration replaced the watchdog's decoding controller, leaving that later maintenance call uncancelled. A wired reproduction returned 504 but subsequently committed one block. Request abort registration now retains all phase controllers; watchdog expiry aborts every registered phase and registration after cancellation remains latched.
+
+The same reproduction now observes zero blocks, a closed upstream maintenance fetch and zero in-flight request ownership after the watchdog 504, even after the fake upstream's delayed response would have completed. It exercises actual overflow recovery rather than only initial maintenance.
+
+Maintenance now uses the normal throttle governor with the resolved destination, lane credential and exact request model. An active matching hold defers maintenance without egress, signature mutation or attempt consumption. Admitted responses use normal non-429 resolution or bounded provisional 429 classification, including Retry-After and conservative account scope for malformed errors. Transport/cancellation paths release their admitted probe tokens. This adds no hidden retry loop and preserves unrelated credential/model holds.
+
+Regression cases cover matching account/credential/model holds, unrelated scope, model-specific 429 accounting, opaque 429 fallback, an expired hold's single-flight probe, successful resolution and transport-failure release. Local validation: **104 targeted tests passed** with no failures or skips, plus typecheck. The command uses the hermetic preload:
+
+```sh
+node --import ./tests/preload-test-env.mjs --import tsx --test tests/bounded-maintenance.test.ts tests/bounded-maintenance-safety.test.ts tests/issue4204-throttle-governor.test.ts tests/fix-806-request-watchdog.test.ts tests/native-call-carrier-e2e.test.ts tests/native-fold-invariant.test.ts
+```
+
+The other six warnings in that review are outside this priority pass. No live deployment or persisted-cache migration is performed; merge acceptance still requires current review and remote CI results.

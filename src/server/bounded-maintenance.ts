@@ -9,6 +9,7 @@ import { fetchWithTimeout } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
 import { externalSummaryEnabled } from "../external-summary-surface.js";
 import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
+import { beginProvisionalUpstreamThrottle429, noteUpstreamThrottleResolved, releaseUpstreamThrottleProbe, throttle429ModelScope, upstreamThrottleGate } from "../upstream-throttle.js";
 import { markDirty } from "../session.js";
 import { buildForwardTarget, inboundResignCredential, resolveUpstream, type Prepared } from "../server.js";
 
@@ -140,7 +141,7 @@ function archiveChunk(prepared: Prepared, core: CompressionCore, config: Config)
     return best;
 }
 
-async function readJson(response: Response): Promise<Record<string, unknown>> {
+async function readResponseText(response: Response): Promise<string> {
     const reader = response.body?.getReader();
     if (!reader) throw new Error("empty response");
     const chunks: Uint8Array[] = [];
@@ -154,7 +155,7 @@ async function readJson(response: Response): Promise<Record<string, unknown>> {
             chunks.push(next.value);
         }
     } finally { await reader.cancel().catch(() => {}); }
-    return JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
+    return Buffer.concat(chunks).toString();
 }
 
 export async function maybeRunBoundedMaintenance(args: {
@@ -195,6 +196,12 @@ export async function maybeRunBoundedMaintenance(args: {
     if (inboundResignCredential(req.headers, opts, target.upstreamUrl) !== undefined) return false;
     const credential = laneCredential(opts.routes, target.upstreamUrl, message => log("warn", message));
     if (credential !== undefined) applyLaneCredential(target.headers, credential, message => log("warn", message));
+    const model = typeof body.model === "string" ? body.model : undefined;
+    const admission = upstreamThrottleGate(target.upstreamUrl, target.headers, Date.now(), model);
+    if (admission.reject !== undefined) {
+        log("info", `[${session.id}] [bounded-maintenance] deferred by upstream rate-limit hold`);
+        return false;
+    }
     attemptedRequests.add(req);
     session.metadata.boundedMaintenanceAttempt = signature;
     const attempt = retry?.pending && retry.attempts < MAX_MAINTENANCE_ATTEMPTS ? retry.attempts + 1 : 1;
@@ -242,10 +249,19 @@ export async function maybeRunBoundedMaintenance(args: {
         httpStatus = response.status;
         stage = "read-response";
         let json: Record<string, unknown>;
+        const settle429 = response.status === 429
+            ? beginProvisionalUpstreamThrottle429(target.upstreamUrl, target.headers, response.headers.get("retry-after"), Date.now(), model, admission.probeToken)
+            : undefined;
+        if (response.status !== 429) noteUpstreamThrottleResolved(target.upstreamUrl, target.headers, response.status, Date.now(), model, admission.probeToken);
         try {
-            if (!response.ok) { failureKind = "http"; await response.body?.cancel(); throw new Error("maintenance HTTP failure"); }
-            json = await readJson(response);
-        } finally { clearTimer(); }
+            if (!response.ok) {
+                failureKind = "http";
+                if (settle429) settle429(throttle429ModelScope(response.status, model, await readResponseText(response)));
+                else await response.body?.cancel();
+                throw new Error("maintenance HTTP failure");
+            }
+            json = JSON.parse(await readResponseText(response)) as Record<string, unknown>;
+        } finally { settle429?.(); clearTimer(); }
         responseMs = Date.now() - started;
         stage = "validate";
         if (deadline.aborted) throw new Error("maintenance aborted");
@@ -283,6 +299,7 @@ export async function maybeRunBoundedMaintenance(args: {
         log("warn", `[${session.id}] [bounded-maintenance] failed; continuing original task without an in-turn retry`);
         return session.state.blocks.some(b => !before.has(b.blockId));
     } finally {
+        releaseUpstreamThrottleProbe(admission.probeToken);
         const blocksCreated = session.state.blocks.filter(b => !before.has(b.blockId)).length;
         session.metadata.boundedMaintenanceRetry = {
             pending: blocksCreated === 0 && failureKind !== "client-abort",

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import test, { afterEach, beforeEach } from 'node:test';
 import http from 'node:http';
 import { once } from 'node:events';
 import { Socket, type AddressInfo } from 'node:net';
@@ -10,9 +10,21 @@ import { SessionStore, _setStoreForTest } from '../src/persist.js';
 import { configureBoundedMaintenance, maybeRunBoundedMaintenance } from '../src/server/bounded-maintenance.js';
 import { startServer, stripKernelSummaries, type Prepared } from '../src/server.js';
 import { executeProxyToolAsync } from '../src/loop/core.js';
+import { _resetUpstreamThrottleForTest, activeThrottleHolds, noteUpstreamThrottle429, releaseUpstreamThrottleProbe, upstreamThrottleGate, upstreamThrottlePeekReject } from '../src/upstream-throttle.js';
 
 process.env.NODE_ENV = 'test';
 _setStoreForTest(new SessionStore({ enabled: false }));
+const throttleEnv = new Map<string, string | undefined>();
+beforeEach(() => {
+    for (const [key, value] of Object.entries({ BILI_THROTTLE_429: '1', BILI_THROTTLE_429_SCOPE: 'credential' })) {
+        throttleEnv.set(key, process.env[key]); process.env[key] = value;
+    }
+    _resetUpstreamThrottleForTest();
+});
+afterEach(() => {
+    _resetUpstreamThrottleForTest();
+    for (const [key, value] of throttleEnv) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+});
 interface ArchiveEntry { role: string; type?: string; tool?: string; toolCallId?: string; content?: string }
 interface MaintenanceRequest { messages: { content: string }[] }
 const summary = 'Archived disposable fixture facts. The task is complete; originals retain the exact details for subsequent retrieval.';
@@ -36,7 +48,8 @@ function prepared(ctx: ReturnType<typeof fixture>, startIndex: number, endIndex:
     } as Prepared;
 }
 async function run(ctx: ReturnType<typeof fixture>, p: Prepared, callId = 'hidden-maintenance', beforeReply?: () => void,
-    settings: { credential?: boolean; content?: string; incoming?: http.IncomingMessage; chain?: boolean } = {}) {
+    settings: { credential?: boolean; content?: string; incoming?: http.IncomingMessage; chain?: boolean;
+        beforeSend?: (url: string) => void; status?: number; responseBody?: string; transportFailure?: boolean } = {}) {
     let request: MaintenanceRequest | undefined;
     let capturedHeaders: http.IncomingHttpHeaders | undefined;
     const logs: string[] = [];
@@ -47,8 +60,11 @@ async function run(ctx: ReturnType<typeof fixture>, p: Prepared, callId = 'hidde
         capturedHeaders = req.headers;
         const span = /exactly (m\d+–m\d+)/.exec(request.messages[1].content)?.[1];
         beforeReply?.();
+        if (settings.transportFailure) { req.socket.destroy(); return; }
+        res.statusCode = settings.status ?? 200;
         res.setHeader('content-type', 'application/json');
-        res.end(JSON.stringify({ choices: [{ finish_reason: 'tool_calls', message: { tool_calls: [{ id: callId, type: 'function', function: { name: 'compress', arguments: JSON.stringify({ content: settings.content ?? `${span} Fixture archive\n${summary}` }) } }] } }] }));
+        if (settings.status === 429) res.setHeader('retry-after', '120');
+        res.end(settings.responseBody ?? JSON.stringify({ choices: [{ finish_reason: 'tool_calls', message: { tool_calls: [{ id: callId, type: 'function', function: { name: 'compress', arguments: JSON.stringify({ content: settings.content ?? `${span} Fixture archive\n${summary}` }) } }] } }] }));
     });
     server.listen(0, '127.0.0.1'); await once(server, 'listening');
     let target = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -65,6 +81,7 @@ async function run(ctx: ReturnType<typeof fixture>, p: Prepared, callId = 'hidde
     const incoming = settings.incoming ?? new http.IncomingMessage(new Socket());
     incoming.url = `/bili/${target}/v1/chat/completions`;
     try {
+        settings.beforeSend?.(`${target}/v1/chat/completions`);
         const applied = await maybeRunBoundedMaintenance({ prepared: p, req: incoming,
             opts, core: ctx.core, config: ctx.config, signal: new AbortController().signal, log: (_level, text) => logs.push(text) });
         return { applied, request, capturedHeaders, logs, receipt: ctx.session.metadata.boundedMaintenanceLast };
@@ -331,3 +348,91 @@ test('all assistant companions of reasoning remain complete without swallowing s
     assert.ok(result.applied);
     assert.deepEqual(ctx.session.state.blocks[0].effectiveMessageIds, ['safe']);
 });
+
+test('an active account hold prevents maintenance egress without consuming an attempt', async () => {
+    const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+    const retry = { pending: true, attempts: 1, nextAttemptAt: 0 };
+    ctx.session.metadata.boundedMaintenanceRetry = retry;
+    const result = await run(ctx, prepared(ctx, 0, 0), undefined, undefined, {
+        beforeSend: url => noteUpstreamThrottle429(url, {}, '120'),
+    });
+    assert.equal(result.request, undefined, 'held maintenance must produce zero upstream requests');
+    assert.equal(result.applied, false);
+    assert.deepEqual(ctx.session.metadata.boundedMaintenanceRetry, retry);
+    assert.equal(ctx.session.metadata.boundedMaintenanceAttempt, undefined);
+});
+
+test('maintenance admission uses the resolved lane credential hold', async () => {
+    const previous = process.env.BILI_REVIEW_FIXTURE_KEY;
+    process.env.BILI_REVIEW_FIXTURE_KEY = 'disposable-fixture-key';
+    try {
+        const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+        const result = await run(ctx, prepared(ctx, 0, 0), undefined, undefined, { credential: true,
+            beforeSend: url => noteUpstreamThrottle429(url, { authorization: 'Bearer disposable-fixture-key' }, '120'),
+        });
+        assert.equal(result.request, undefined);
+    } finally { if (previous === undefined) delete process.env.BILI_REVIEW_FIXTURE_KEY; else process.env.BILI_REVIEW_FIXTURE_KEY = previous; }
+});
+
+test('a maintenance 429 records Retry-After and the exact recognized model scope', async () => {
+    const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+    let target = '';
+    const result = await run(ctx, prepared(ctx, 0, 0), undefined, undefined, { status: 429,
+        responseBody: JSON.stringify({ error: { code: 'keyring_model_temporarily_unavailable', model: 'local-fixture' } }),
+        beforeSend: url => { target = url; },
+    });
+    assert.ok(result.request);
+    assert.equal(result.applied, false);
+    const blocked = upstreamThrottlePeekReject(target, {}, Date.now(), 'local-fixture');
+    assert.ok(blocked, 'maintenance 429 must hold subsequent ordinary sends');
+    assert.ok(blocked.retryAfterSec! >= 119);
+    assert.equal(upstreamThrottlePeekReject(target, {}, Date.now(), 'other-model'), undefined);
+});
+
+test('malformed maintenance 429 conservatively records an account hold', async () => {
+    const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+    let target = '';
+    await run(ctx, prepared(ctx, 0, 0), undefined, undefined, { status: 429, responseBody: 'opaque gateway limit', beforeSend: url => { target = url; } });
+    assert.ok(upstreamThrottlePeekReject(target, {}, Date.now(), 'other-model'));
+});
+
+test('an expired matching hold admits one maintenance probe and success clears it', async () => {
+    const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+    let target = '';
+    let probeWasOwned = false;
+    const result = await run(ctx, prepared(ctx, 0, 0), undefined, () => {
+        probeWasOwned = upstreamThrottlePeekReject(target, {}, Date.now(), 'local-fixture') !== undefined;
+    }, { beforeSend: url => { target = url; noteUpstreamThrottle429(url, {}, '120', Date.now() - 130000); } });
+    assert.equal(probeWasOwned, true, 'the in-flight maintenance probe owns the slot');
+    assert.equal(result.applied, true);
+    assert.equal(activeThrottleHolds().length, 0);
+});
+
+test('failed maintenance releases its admitted probe without clearing the hold', async () => {
+    const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+    let target = '';
+    let probeWasOwned = false;
+    const result = await run(ctx, prepared(ctx, 0, 0), undefined, () => {
+        probeWasOwned = upstreamThrottlePeekReject(target, {}, Date.now(), 'local-fixture') !== undefined;
+    }, { transportFailure: true, beforeSend: url => { target = url; noteUpstreamThrottle429(url, {}, '120', Date.now() - 130000); } });
+    assert.equal(probeWasOwned, true);
+    assert.equal(result.applied, false);
+    assert.ok(activeThrottleHolds().length > 0);
+    const next = upstreamThrottleGate(target, {}, Date.now(), 'local-fixture');
+    assert.equal(next.reject, undefined, 'failed probe cannot retain the in-flight slot');
+    releaseUpstreamThrottleProbe(next.probeToken);
+});
+
+for (const scope of ['credential', 'other-model', 'same-model'] as const) {
+    test(`maintenance honors ${scope} hold scope without widening it`, async () => {
+        const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+        const result = await run(ctx, prepared(ctx, 0, 0), undefined, undefined, {
+            beforeSend: url => noteUpstreamThrottle429(url,
+                scope === 'credential' ? { authorization: 'Bearer different-disposable-key' } : {}, '120', Date.now(),
+                scope === 'same-model' ? 'local-fixture' : scope === 'other-model' ? 'other-model' : undefined),
+        });
+        assert.equal(result.applied, scope !== 'same-model');
+        assert.equal(result.request !== undefined, scope !== 'same-model');
+        assert.equal(activeThrottleHolds().length, 1, 'unrelated or blocked holds remain intact');
+    });
+}
