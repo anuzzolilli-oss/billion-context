@@ -1,0 +1,258 @@
+import assert from "node:assert/strict";
+import http from "node:http";
+import { once } from "node:events";
+import test from "node:test";
+import { defaultConfig } from "acp-kernel";
+import { startServer } from "../src/server.js";
+import { loadOptions } from "../src/config.js";
+import { SessionStore, _setStoreForTest } from "../src/persist.js";
+import { _setForTest as setRegistryForTest } from "../src/registry.js";
+import { getSession } from "../src/session.js";
+import { _setInvariantJudgeForTest, _setInvariantJudgeFaultForTest, type JudgeVerdict } from "../src/invariant-judge.js";
+
+process.env.NODE_ENV = "test";
+let scenarioId = 0;
+
+async function scenario(enabled: boolean, mode = "success") {
+    let maintenance = 0;
+    const maintenanceBodies: Record<string, unknown>[] = [];
+    const mains: Record<string, unknown>[] = [];
+    const upstream = http.createServer(async (req, res) => {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(Buffer.from(c));
+        const body = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
+        if (typeof body.tool_choice === "object" && body.tool_choice !== null) {
+            maintenance++;
+            maintenanceBodies.push(body);
+            assert.equal((body.tools as unknown[]).length, 1);
+            assert.equal(body.parallel_tool_calls, false);
+            assert.equal(body.stream, false);
+            if (mode === "http-error") { res.writeHead(503); res.end("UPSTREAM_SECRET"); return; }
+            if (mode === "timeout") { return; }
+            res.writeHead(200, { "content-type": "application/json" });
+            const span = /exactly (m\d+\u2013m\d+)/.exec(JSON.stringify(body))?.[1];
+            assert.ok(span);
+            const message = mode === "malformed" ? { role: "assistant", content: "no tool" } : {
+                role: "assistant", content: null,
+                tool_calls: [{ id: "maint-call", type: "function", function: { name: "compress", arguments: JSON.stringify({ content: span + ' Archived disposable facts\nProject CEDAR; owner Nia; budget 4826 credits; deadline 2026-12-23. The archive code is retrievable from originals.' }) } }],
+            };
+            if (message.tool_calls) {
+                if (mode === "wrong-tool") message.tool_calls[0].function.name = "read_fixture";
+                if (mode === "wrong-range") message.tool_calls[0].function.arguments = JSON.stringify({ content: "m99998–m99999\nNot a real range" });
+                if (mode === "no-op") message.tool_calls[0].function.arguments = JSON.stringify({ content: span + "\n" });
+                if (mode === "encoded-extra-range") message.tool_calls[0].function.arguments = JSON.stringify({ content: span + " Topic\\nSummary of consumed fixture facts.\\nm99998–m99999 Extra\\nDo not apply this extra range." });
+                if (mode === "multiple") message.tool_calls.push(message.tool_calls[0]);
+            }
+            res.end(JSON.stringify({ model: "measured-fixture", usage: { prompt_tokens: 8123, completion_tokens: 201, completion_tokens_details: { reasoning_tokens: 17 } }, choices: [{ message, finish_reason: mode === "truncated" ? "length" : "tool_calls" }] }));
+        } else {
+            res.writeHead(200, { "content-type": "application/json" });
+            mains.push(body);
+            res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: "ACK" }, finish_reason: "stop" }], usage: { prompt_tokens: 50000, completion_tokens: 1 } }));
+        }
+    });
+    upstream.listen(0, "127.0.0.1"); await once(upstream, "listening");
+    const port = (upstream.address() as { port: number }).port;
+    _setStoreForTest(new SessionStore({ enabled: false })); setRegistryForTest({});
+    const opts = { ...loadOptions(), host: "127.0.0.1", port: 0, log: false, debug: false,
+        routes: { [`http://127.0.0.1:${port}`]: { models: { "maintenance-fixture": { context: 64000 } } } },
+        modelContextLimit: 64000, kernelConfig: defaultConfig(64000),
+        compress: { injectTool: true, injectNudge: true },
+        passthrough: false, autoUpdate: false, advisoryCheck: false, releaseNotesCheck: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts, enabled ? { boundedMaintenance: { timeoutMs: mode === "timeout" ? 25 : 15000 } } : undefined);
+    await once(proxy, "listening");
+    const origin = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
+    const headers: Record<string, string> = { "content-type": "application/json", "x-bili-plugin": "pi", "x-bili-plugin-conversation": "bounded-" + mode + enabled + "-" + ++scenarioId, "x-bili-plugin-context-window": "64000" };
+    if (mode === "wire") { delete headers["x-bili-plugin"]; headers["x-acp-session"] = headers["x-bili-plugin-conversation"]; }
+    const tools = [
+        { type: "function", function: { name: "read_fixture", description: "Read fixture", parameters: { type: "object", properties: {} } } },
+        { type: "function", function: { name: "compress", description: "Compress consumed context", parameters: { type: "object", properties: { content: { type: "string" } } } } },
+    ];
+    const send = async (messages: unknown[]) => {
+        const r = await fetch(`${origin}/bili/http://127.0.0.1:${port}/v1/chat/completions`, { method: "POST", headers, body: JSON.stringify({ model: "maintenance-fixture", max_tokens: 2048, messages, tools: mode === "no-compress-tool" ? tools.slice(0, 1) : tools, tool_choice: mode === "tool-none" ? "none" : "auto", stream: false }) });
+        assert.equal(r.status, 200); await r.text();
+    };
+    try {
+        const old = "Project CEDAR; owner Nia; budget 4826 credits; deadline 2026-12-23. ARCHIVE-ORIGINAL-ONLY. " + "old scenery ".repeat(1800);
+        const toolFirst = mode === "tool-first";
+        const seed = toolFirst ? [{ role: "assistant", content: null, tool_calls: [{ id: "first-read", type: "function", function: { name: "read_fixture", arguments: "{}" } }] }, { role: "tool", tool_call_id: "first-read", content: old }, { role: "user", content: "inspect fixture" }] : [{ role: "user", content: "hello" }];
+        await send(seed);
+        const messages: unknown[] = toolFirst ? [...seed, { role: "assistant", content: "ACK" }] : [{ role: "user", content: "hello" }, { role: "assistant", content: "ACK" }, { role: "user", content: "inspect fixture" }, { role: "assistant", content: old }];
+        for (let i = 0; i < 12; i++) messages.push({ role: "user", content: mode === "chunked" ? "漢字🙂".repeat(350) : "u".repeat(1000) }, { role: "assistant", content: "a".repeat(1000) });
+        if (mode === "chunked") messages.push({ role: "assistant", content: "ARCHIVE-UNSELECTED-MUST-STAY " + "later archive ".repeat(2000) });
+        if (mode === "chunked") messages[3] = { role: "assistant", content: old + "漢字🙂".repeat(5000) };
+        if (mode === "oversized") messages[3] = { role: "assistant", content: "OVERSIZED-ORIGINAL-MUST-STAY " + "漢字🙂".repeat(10000) };
+        messages.push({ role: "user", content: "LATEST-WORK-MUST-STAY: continue" });
+        if (mode === "media") messages[2] = { role: "user", content: [{ type: "text", text: "Inspect old image" }, { type: "image_url", image_url: { url: "https://example.invalid/disposable.png" } }] };
+        if (mode === "native-echo") {
+            await send(messages);
+            for (let fold = 0; fold < 2; fold++) {
+                if (fold === 1) {
+                    messages.push({ role: "assistant", content: "SECOND ARCHIVE " + "consumed second fixture ".repeat(1200) }, { role: "user", content: "LATEST-WORK-MUST-STAY: second protected request" });
+                    await send(messages);
+                }
+                const invoke = async (tool: string, args: unknown, toolCallId?: string) => {
+                    const response = await fetch(`${origin}/__bili/plugin/tool`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ conversationId: headers["x-bili-plugin-conversation"], nativeCaller: true, tool, args, toolCallId }) });
+                    assert.equal(response.status, 200);
+                    return await response.json() as { result: string; outcome?: string };
+                };
+                const status = await invoke("acp_status", {});
+                const spans = [...status.result.matchAll(/(m\d+)[–-](m\d+)\s+\d+ msgs/g)];
+                const span = fold === 0 ? spans[0] : spans.at(-1);
+                assert.ok(span, status.result);
+                const args = { content: `${span[1]}–${span[2]} Archived disposable facts\nProject CEDAR; owner Nia; budget 4826 credits; deadline 2026-12-23. Original details remain retrievable.` };
+                const id = `native-compress-${fold}`;
+                const result = await invoke("compress", args, id);
+                assert.equal(result.outcome, "applied", result.result);
+                messages.push({ role: "assistant", content: null, tool_calls: [{ id, type: "function", function: { name: "compress", arguments: JSON.stringify(args) } }] }, { role: "tool", tool_call_id: id, content: result.result });
+                await send(messages);
+            }
+        }
+        else if (mode === "concurrent") await Promise.all([send(messages), send(messages)]);
+        else await send(messages);
+        await send([...messages, { role: "assistant", content: "ACK" }, { role: "user", content: "continue again" }]);
+        const session = getSession(headers["x-bili-plugin-conversation"]);
+        return { maintenance, maintenanceBodies, mains, blocks: session.state.blocks.length, receipt: session.metadata.boundedMaintenanceLast as { blocksCreated?: number; outcome?: string; sourceBytes?: number; requestBytes?: number; requestedModel?: string; returnedModel?: string; requestedReasoningEffort?: string; inputTokens?: number; reasoningTokens?: number; failureKind?: string; httpStatus?: number; stage?: string; headersMs?: number } | undefined };
+    } finally {
+        proxy.closeAllConnections(); await new Promise<void>(r => proxy.close(() => r()));
+        upstream.closeAllConnections(); await new Promise<void>(r => upstream.close(() => r()));
+    }
+}
+
+test("wired Pi native call echo stays clean across two folds and later requests", async () => {
+    const verdicts: JudgeVerdict[] = [];
+    _setInvariantJudgeForTest(true, v => verdicts.push(v));
+    try {
+        const result = await scenario(false, "native-echo");
+        assert.ok(result.blocks >= 2);
+        assert.ok(verdicts.some(v => v.folded));
+        assert.ok(verdicts.every(v => v.ok), JSON.stringify(verdicts.filter(v => !v.ok)));
+    } finally { _setInvariantJudgeForTest(true); }
+});
+
+test("wired native tool-first fold is clean and protected-tail corruption still fires", async () => {
+    const verdicts: JudgeVerdict[] = [];
+    _setInvariantJudgeForTest(true, v => verdicts.push(v));
+    try {
+        await scenario(true, "tool-first");
+        assert.ok(verdicts.some(v => v.folded));
+        assert.ok(verdicts.every(v => v.ok), JSON.stringify(verdicts.filter(v => !v.ok)));
+        verdicts.length = 0;
+        _setInvariantJudgeFaultForTest(exit => exit.some(m => m.text?.includes("[Compressed conversation section]"))
+            ? exit.map(m => m.text?.includes("LATEST-WORK-MUST-STAY") ? { ...m, text: "CORRUPTED PROTECTED TAIL" } : m) : exit);
+        await scenario(true, "tool-first");
+        assert.ok(verdicts.some(v => v.folded && !v.ok));
+    } finally {
+        _setInvariantJudgeFaultForTest(null);
+        _setInvariantJudgeForTest(true);
+    }
+});
+
+test("opt-in runs one verified maintenance turn and forwards folded history with normal tool choice", async () => {
+    const result = await scenario(true);
+    assert.equal(result.maintenance, 1);
+    assert.equal(result.blocks, 1);
+    assert.equal(result.receipt?.blocksCreated, 1);
+    assert.equal(result.receipt?.outcome, "applied");
+    assert.equal(result.mains[1].tool_choice, "auto");
+    assert.ok(!JSON.stringify(result.mains[1]).includes("ARCHIVE-ORIGINAL-ONLY"));
+    assert.ok(JSON.stringify(result.mains[1]).includes("LATEST-WORK-MUST-STAY"));
+    assert.ok(JSON.stringify(result.mains[1]).includes("CEDAR"));
+});
+
+test("default startup never runs hidden maintenance", async () => {
+    assert.equal((await scenario(false)).maintenance, 0);
+});
+
+test("chunked maintenance bounds UTF-8 archive bytes and preserves unselected history", async () => {
+    const result = await scenario(true, "chunked");
+    assert.ok(result.maintenance >= 1);
+    const request = result.maintenanceBodies[0];
+    const user = (request.messages as { content: string }[])[1].content;
+    const source = user.slice(user.indexOf("\n") + 1);
+    assert.ok(Buffer.byteLength(source) <= 32768, `archive bytes ${Buffer.byteLength(source)}`);
+    assert.ok(!source.includes("ARCHIVE-UNSELECTED-MUST-STAY"));
+    assert.ok(JSON.stringify(result.mains[1]).includes("ARCHIVE-UNSELECTED-MUST-STAY"));
+    assert.ok(result.blocks >= 1, JSON.stringify(result.receipt));
+});
+
+test("oversized originals are never truncated or falsely claimed by a fold", async () => {
+    const result = await scenario(true, "oversized");
+    assert.ok(JSON.stringify(result.mains[1]).includes("OVERSIZED-ORIGINAL-MUST-STAY"));
+    for (const request of result.maintenanceBodies) assert.ok(!JSON.stringify(request).includes("OVERSIZED-ORIGINAL-MUST-STAY"));
+});
+
+test("maintenance measures requested and returned model and actual usage", async () => {
+    const result = await scenario(true);
+    assert.equal(result.receipt?.requestedModel, "maintenance-fixture");
+    assert.equal(result.receipt?.returnedModel, "measured-fixture");
+    assert.equal(result.receipt?.requestedReasoningEffort, "low");
+    assert.equal(result.receipt?.inputTokens, 8123);
+    assert.equal(result.receipt?.reasoningTokens, 17);
+    assert.ok((result.receipt?.sourceBytes ?? Infinity) <= 32768);
+    assert.ok((result.receipt?.requestBytes ?? 0) > (result.receipt?.sourceBytes ?? 0));
+    assert.ok(typeof result.receipt?.headersMs === "number");
+    assert.equal(result.receipt?.stage, "complete");
+});
+
+test("maintenance records sanitized HTTP and deadline failures", async () => {
+    const http = await scenario(true, "http-error");
+    assert.equal(http.receipt?.failureKind, "http");
+    assert.equal(http.receipt?.httpStatus, 503);
+    assert.ok(!JSON.stringify(http.receipt).includes("UPSTREAM_SECRET"));
+    const timeout = await scenario(true, "timeout");
+    assert.equal(timeout.receipt?.failureKind, "deadline");
+    assert.equal(timeout.receipt?.stage, "fetch");
+    assert.equal(timeout.receipt?.blocksCreated, 0);
+});
+
+test("maintenance reads only eligible originals and leaves protected working content with the normal request", async () => {
+    const result = await scenario(true, "source-only");
+    assert.equal(result.maintenance, 1);
+    assert.ok(JSON.stringify(result.maintenanceBodies[0]).includes("ARCHIVE-ORIGINAL-ONLY"));
+    assert.equal(result.maintenanceBodies[0].max_tokens, 1024);
+    assert.equal(result.maintenanceBodies[0].reasoning_effort, "low");
+    assert.ok(!JSON.stringify(result.maintenanceBodies[0]).includes("LATEST-WORK-MUST-STAY"));
+    assert.ok(JSON.stringify(result.mains[1]).includes("LATEST-WORK-MUST-STAY"));
+});
+
+test("resumed task receives a factual completion receipt only after a verified new block", async () => {
+    const result = await scenario(true, "receipt");
+    const resumed = JSON.stringify(result.mains[1]);
+    assert.ok(resumed.includes("[bili-maintenance-receipt]"));
+    assert.ok(resumed.includes("b1"));
+    assert.ok(!JSON.stringify(result.mains[2]).includes("[bili-maintenance-receipt]"));
+});
+
+test("malformed maintenance is bounded and leaves originals available to the normal request", async () => {
+    const result = await scenario(true, "malformed");
+    assert.equal(result.maintenance, 1);
+    assert.ok(JSON.stringify(result.mains[1]).includes("ARCHIVE-ORIGINAL-ONLY"));
+});
+
+for (const mode of ["wrong-tool", "wrong-range", "no-op", "encoded-extra-range", "multiple", "http-error", "timeout", "truncated"]) {
+    test(`${mode} maintenance cannot drop originals or repeat within the turn`, async () => {
+        const result = await scenario(true, mode);
+        assert.equal(result.maintenance, 1);
+        assert.equal(result.mains.length, 3);
+        assert.equal(result.mains[1].tool_choice, "auto");
+        assert.ok(JSON.stringify(result.mains[1]).includes("ARCHIVE-ORIGINAL-ONLY"));
+        assert.ok(JSON.stringify(result.mains[1]).includes("LATEST-WORK-MUST-STAY"));
+        assert.ok(!JSON.stringify(result.mains[1]).includes("[bili-maintenance-receipt]"));
+    });
+}
+
+test("concurrent requests for one session cannot duplicate maintenance", async () => {
+    const result = await scenario(true, "concurrent");
+    assert.equal(result.maintenance, 1);
+    assert.equal(result.blocks, 1);
+});
+
+for (const mode of ["tool-none", "no-compress-tool", "wire", "media"]) {
+    test(`${mode} does not opt into native bounded maintenance`, async () => {
+        const result = await scenario(true, mode);
+        assert.equal(result.maintenance, 0);
+        assert.ok(JSON.stringify(result.mains[1]).includes("ARCHIVE-ORIGINAL-ONLY"));
+    });
+}

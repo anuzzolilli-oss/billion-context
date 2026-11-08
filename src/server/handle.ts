@@ -1,6 +1,7 @@
 // #1440 P2 cut 3: proxy request pipeline (handle) extracted verbatim from src/server.ts — pure move, zero behavior change.
 
 import http from "node:http";
+import { maybeRunBoundedMaintenance, withBoundedMaintenanceReceipt } from "./bounded-maintenance.js";
 import { Readable } from "node:stream";
 import fs from "node:fs";
 import path from "node:path";
@@ -2631,6 +2632,9 @@ async function handleRequest(
                     reqConfig = { ...reqConfig, modelContextLimit: overflowWindow };
                 }
                 prepared = await runPrepare();
+                if (await maybeRunBoundedMaintenance({ prepared, req, opts, core, config: reqConfig, signal: decodingSignal, log })) {
+                    prepared = withBoundedMaintenanceReceipt(await runPrepare());
+                }
                 memProbe(opts.debug, log, session.id, "prepared", typeof prepared.body === "string" ? Buffer.byteLength(prepared.body) : prepared.body.byteLength);
                 // #4528: prepare ran the per-turn O(messages) scan passes over
                 // the resent history; yield so UI/API requests queue-drained

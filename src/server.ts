@@ -644,7 +644,9 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     };
 }
 
-export async function startServer(opts: ProxyOptions): Promise<http.Server> {
+export async function startServer(opts: ProxyOptions, runtime?: import("./server/bounded-maintenance.js").ServerRuntimeOptions): Promise<http.Server> {
+    const { configureBoundedMaintenance } = await import("./server/bounded-maintenance.js");
+    configureBoundedMaintenance(opts, runtime);
     const launchToken = process.env.BILI_LAUNCH_TOKEN?.trim();
     // #1225: lane identity + code fingerprint recorded into the instance file
     // so later launches can decide reuse by WHO started us and WHICH code we
