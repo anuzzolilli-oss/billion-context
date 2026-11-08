@@ -39,7 +39,7 @@ for (const placement of ["tail", "prefix", "cross-boundary"] as const) {
             assert.equal(judgeInboundOutbound(baseline, projection.messages, options).ok, true, "intact tail accepted");
             assert.equal(judgeInboundOutbound(baseline, projection.messages.map((m, i) => i === 0 ? { ...m, text: "SERVER RENDERED PREFIX" } : m), options).ok, true, "server prefix is outside the tail-fidelity contract");
             for (const fault of ["rewrite", "drop"] as const) {
-                const exit = openaiToCore({ messages: coreToOpenai(projection.messages.map(m => ({ ...m,
+                const exit: BiliMessage[] = openaiToCore({ messages: coreToOpenai(projection.messages.map(m => ({ ...m,
                     text: m.text?.replace("LIVE USER FACTS", fault === "rewrite" ? "CORRUPTED" : ""),
                 }))) }).msgs;
                 assert.equal(judgeInboundOutbound(baseline, exit, options).ok, false, `${fault} of live text rejected`);
