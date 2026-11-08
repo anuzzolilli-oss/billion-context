@@ -1,7 +1,7 @@
 import { fetchWithCodexCatalogCache, isCodexCatalogRequest } from "./codex-catalog-cache.js";
 import { createHandoffReply, captureHandoffJson } from "./handoff-response.js";
 import { checkOutboundBody, OutboundBodyTooLargeError } from "../request-body-budget.js";
-import { maybeRunInvariantJudge } from "../invariant-judge.js";
+import { invariantJudgeArmed, maybeRunInvariantJudge } from "../invariant-judge.js";
 // #1440 P2 cut 4: upstream relay zone (forward) extracted verbatim from src/server.ts — pure move, zero behavior change.
 
 import http from "node:http";
@@ -26,7 +26,7 @@ import { findRoute, resolveDeclaredProtocol, type ProxyOptions } from "../config
 import { makeContinuationRefetch } from "../degenerate-retry.js";
 import { dumpRejectedBody } from "../error-dump.js";
 import { extractWsOversizeError, formatMiB, shedEgressIfOverBudget, shedWireImages, shedWireImagesToCount, type ShedStats, type ShedWireImagesResult } from "../egress-shed.js";
-import type { ImageArchiveReceipt } from "../image-archive-receipt.js";
+import type { ImageTransformReceipt } from "../image-archive-receipt.js";
 import { conversationPromptSections, externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
 import { fakeBufCap, injectFakeCompletionHint, isFakeCompletion, maxFakeCompletionRetries } from "../fake-completion.js";
 import { fetchWithTimeout, fetchWithTransportRetry } from "../fetch-util.js";
@@ -647,13 +647,18 @@ async function forwardCaptured(
     // (no transport installed); managed non-WS transports pass through untouched
     // (#3701 Finding 1).
     let outboundCopyRewritten = false;
-    const imageArchiveBatches: ImageArchiveReceipt[][] = [];
+    const imageArchiveBatches: ImageTransformReceipt[][] = [];
     if (prepared && !prepared.sidePassthrough && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
-        const byteArchives: ImageArchiveReceipt[] = [];
+        const byteArchives: ImageTransformReceipt[] = [];
         const byteArchiveSession = prepared.session;
-        const shed = await shedEgressIfOverBudget(wireBody, prepared.protocol, { sessionId: prepared.session.id, session: prepared.session, log, phase: "pre-send", onImageArchive: async receipt => {
-            if (await verifyArchivedImageSource(byteArchiveSession, receipt)) byteArchives.push(receipt);
-        } });
+        const collectReceipts = invariantJudgeArmed();
+        const shed = await shedEgressIfOverBudget(wireBody, prepared.protocol, {
+            sessionId: prepared.session.id, session: prepared.session, log, phase: "pre-send",
+            onImageResize: collectReceipts ? receipt => { byteArchives.push(receipt); } : undefined,
+            onImageArchive: collectReceipts ? async receipt => {
+                if (await verifyArchivedImageSource(byteArchiveSession, receipt)) byteArchives.push(receipt);
+            } : undefined,
+        });
         if (byteArchives.length) imageArchiveBatches.push(byteArchives);
         if (shed.body !== wireBody) outboundCopyRewritten = true;
         wireBody = shed.body;
@@ -666,12 +671,12 @@ async function forwardCaptured(
         const imgCap = imgOrigin !== undefined ? prepared.session.stats.imageCountCaps?.[imgOrigin] : undefined;
         if (typeof imgCap === "number" && imgCap > 0) {
             const sess = prepared.session;
-            const countArchives: ImageArchiveReceipt[] = [];
+            const countArchives: ImageTransformReceipt[] = [];
             const countShed = await shedWireImagesToCount(wireBody, prepared.protocol, imgCap - 1, {
                 resolveRef: (mt, b64) => refForItemBytes(sess, mt, b64),
-                onImageArchive: async receipt => {
+                onImageArchive: collectReceipts ? async receipt => {
                     if (await verifyArchivedImageSource(sess, receipt)) countArchives.push(receipt);
-                },
+                } : undefined,
             });
             if (countArchives.length) imageArchiveBatches.push(countArchives);
             if (countShed.stats.changed) {

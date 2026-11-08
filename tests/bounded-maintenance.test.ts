@@ -3,7 +3,7 @@ import http from "node:http";
 import { once } from "node:events";
 import test, { mock } from "node:test";
 import { defaultConfig } from "acp-kernel";
-import { startServer } from "../src/server.js";
+import { startServer, _setRequestWatchdogDelayForTest } from "../src/server.js";
 import { loadOptions } from "../src/config.js";
 import { SessionStore, _setStoreForTest } from "../src/persist.js";
 import { _setForTest as setRegistryForTest } from "../src/registry.js";
@@ -33,6 +33,7 @@ async function scenario(enabled: boolean, mode = "success") {
             assert.equal(body.stream, false);
             if (mode === "http-error") { res.writeHead(503); res.end("UPSTREAM_SECRET"); return; }
             if (mode === "timeout" || (retryMode && (maintenance === 1 || mode === "retry-cap"))) { return; }
+            if (mode === "watchdog") await new Promise(resolve => setTimeout(resolve, 180));
             res.writeHead(200, { "content-type": "application/json" });
             const span = /exactly (m\d+\u2013m\d+)/.exec(JSON.stringify(body))?.[1];
             assert.ok(span);
@@ -74,8 +75,9 @@ async function scenario(enabled: boolean, mode = "success") {
         { type: "function", function: { name: "compress", description: "Compress consumed context", parameters: { type: "object", properties: { content: { type: "string" } } } } },
     ];
     const send = async (messages: unknown[]) => {
+        if (mode === "watchdog" && messages.length > 1) _setRequestWatchdogDelayForTest(40);
         const r = await fetch(`${origin}/bili/http://127.0.0.1:${port}/v1/chat/completions`, { method: "POST", headers, body: JSON.stringify({ model: "maintenance-fixture", max_tokens: 2048, messages, tools: mode === "no-compress-tool" ? tools.slice(0, 1) : tools, tool_choice: mode === "tool-none" ? "none" : "auto", stream: false }) });
-        assert.equal(r.status, 200); await r.text();
+        assert.equal(r.status, mode === "watchdog" && messages.length > 1 ? 504 : 200); await r.text();
     };
     try {
         const old = "Project CEDAR; owner Nia; budget 4826 credits; deadline 2026-12-23. ARCHIVE-ORIGINAL-ONLY. " + "old scenery ".repeat(1800);
@@ -115,6 +117,11 @@ async function scenario(enabled: boolean, mode = "success") {
         }
         else if (mode === "concurrent") await Promise.all([send(messages), send(messages)]);
         else await send(messages);
+        if (mode === "watchdog") {
+            await new Promise(resolve => setTimeout(resolve, 250));
+            const session = getSession(headers["x-bili-plugin-conversation"]);
+            return { maintenance, maintenanceBodies, mains, blocks: session.state.blocks.length, requests: session.stats.requests, receipt: undefined };
+        }
         if (retryMode) {
             assert.equal(maintenance, 1);
             assert.equal(getSession(headers["x-bili-plugin-conversation"]).state.blocks.length, 0);
@@ -144,11 +151,12 @@ async function scenario(enabled: boolean, mode = "success") {
         }
         await send([...messages, { role: "assistant", content: "ACK" }, { role: "user", content: "continue again" }]);
         const session = getSession(headers["x-bili-plugin-conversation"]);
-        return { maintenance, maintenanceBodies, mains, blocks: session.state.blocks.length, receipt: session.metadata.boundedMaintenanceLast as { blocksCreated?: number; outcome?: string; sourceBytes?: number; requestBytes?: number; requestedModel?: string; returnedModel?: string; requestedReasoningEffort?: string; inputTokens?: number; reasoningTokens?: number; failureKind?: string; httpStatus?: number; stage?: string; headersMs?: number } | undefined };
+        return { maintenance, maintenanceBodies, mains, blocks: session.state.blocks.length, requests: session.stats.requests, receipt: session.metadata.boundedMaintenanceLast as { blocksCreated?: number; outcome?: string; sourceBytes?: number; requestBytes?: number; requestedModel?: string; returnedModel?: string; requestedReasoningEffort?: string; inputTokens?: number; reasoningTokens?: number; failureKind?: string; httpStatus?: number; stage?: string; headersMs?: number } | undefined };
     } finally {
         proxy.closeAllConnections(); await new Promise<void>(r => proxy.close(() => r()));
         upstream.closeAllConnections(); await new Promise<void>(r => upstream.close(() => r()));
         clock?.mock.restore();
+        _setRequestWatchdogDelayForTest(null);
     }
 }
 
@@ -193,12 +201,20 @@ test("opt-in runs one verified maintenance turn and forwards folded history with
     const result = await scenario(true);
     assert.equal(result.maintenance, 1);
     assert.equal(result.blocks, 1);
+    assert.equal(result.requests, result.mains.length, "maintenance rebuild does not count as a second incoming request");
     assert.equal(result.receipt?.blocksCreated, 1);
     assert.equal(result.receipt?.outcome, "applied");
     assert.equal(result.mains[1].tool_choice, "auto");
     assert.ok(!JSON.stringify(result.mains[1]).includes("ARCHIVE-ORIGINAL-ONLY"));
     assert.ok(JSON.stringify(result.mains[1]).includes("LATEST-WORK-MUST-STAY"));
     assert.ok(JSON.stringify(result.mains[1]).includes("CEDAR"));
+});
+
+test("request watchdog cancels maintenance and cannot commit after the 504", async () => {
+    const result = await scenario(true, "watchdog");
+    assert.equal(result.maintenance, 1);
+    assert.equal(result.blocks, 0);
+    assert.equal(result.mains.length, 1, "only the initial seed request reached the ordinary upstream");
 });
 
 test("default startup never runs hidden maintenance", async () => {

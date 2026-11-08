@@ -8,6 +8,7 @@ import { executeProxyToolAsync } from "../loop/core.js";
 import { fetchWithTimeout } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
 import { externalSummaryEnabled } from "../external-summary-surface.js";
+import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
 import { markDirty } from "../session.js";
 import { buildForwardTarget, inboundResignCredential, resolveUpstream, type Prepared } from "../server.js";
 
@@ -21,6 +22,7 @@ export interface ServerRuntimeOptions {
 }
 
 const enabled = new WeakMap<ProxyOptions, BoundedMaintenanceOptions>();
+const attemptedRequests = new WeakSet<http.IncomingMessage>();
 
 export function configureBoundedMaintenance(opts: ProxyOptions, runtime?: ServerRuntimeOptions): void {
     if (runtime?.boundedMaintenance) enabled.set(opts, runtime.boundedMaintenance);
@@ -39,9 +41,11 @@ function measuredIdentifier(value: unknown): string | undefined {
     return typeof value === "string" && /^[\w.:/\-]{1,160}$/.test(value) ? value : undefined;
 }
 
-function completeUnits(messages: BiliMessage[]): BiliMessage[][] {
+function completeUnits(messages: BiliMessage[]): { start: number; end: number; messages: BiliMessage[]; ambiguous: boolean }[] {
     const ends = messages.map((_, index) => index);
     const pairs = new Map<string, number>();
+    const seenCalls = new Set<string>();
+    const repeatedCalls = new Set<string>();
     let reasoningStart = -1;
     for (const [index, message] of messages.entries()) {
         if (message.role === "assistant" && message.contentType === "reasoning") {
@@ -49,30 +53,35 @@ function completeUnits(messages: BiliMessage[]): BiliMessage[][] {
             ends[reasoningStart] = Math.max(ends[reasoningStart], index);
         } else {
             if (reasoningStart >= 0 && message.role === "assistant") ends[reasoningStart] = Math.max(ends[reasoningStart], index);
-            reasoningStart = -1;
+            if (message.role !== "assistant") reasoningStart = -1;
         }
-        if (message.toolCallId) {
+        if (message.toolCallId && message.contentType === "tool-call") {
+            if (seenCalls.has(message.toolCallId)) repeatedCalls.add(message.toolCallId);
+            seenCalls.add(message.toolCallId);
+            pairs.set(message.toolCallId, index);
+        }
+        else if (message.toolCallId && message.contentType === "tool-result") {
             const first = pairs.get(message.toolCallId);
-            if (first === undefined) pairs.set(message.toolCallId, index);
-            else ends[first] = Math.max(ends[first], index);
+            if (first !== undefined) { ends[first] = Math.max(ends[first], index); pairs.delete(message.toolCallId); }
         }
     }
-    const units: BiliMessage[][] = [];
+    const units: { start: number; end: number; messages: BiliMessage[]; ambiguous: boolean }[] = [];
     for (let start = 0; start < messages.length;) {
         let end = ends[start];
         for (let index = start + 1; index <= end; index++) end = Math.max(end, ends[index]);
-        units.push(messages.slice(start, end + 1));
+        const group = messages.slice(start, end + 1);
+        units.push({ start, end, messages: group, ambiguous: group.some(message => message.toolCallId !== undefined && repeatedCalls.has(message.toolCallId)) });
         start = end + 1;
     }
     return units;
 }
 
 function exactCoverage(prepared: Prepared, core: CompressionCore, config: Config,
-    originals: BiliMessage[], startRef: string, endRef: string, summary: string): boolean {
+    originals: BiliMessage[], startRef: string, endRef: string, summary: string, summaryMaxChars?: number): boolean {
     try {
         const before = new Set(prepared.session.state.blocks.map(block => block.blockId));
         const preview = core.applyCompression({ messages: prepared.originalMessages, state: prepared.session.state, config,
-            ranges: [{ startRef, endRef, summary }] });
+            ranges: [{ startRef, endRef, summary, summaryMaxChars }] });
         const created = preview.state.blocks.filter(block => !before.has(block.blockId));
         if (created.length !== 1) return false;
         const covered = new Set(created[0].effectiveMessageIds);
@@ -85,7 +94,7 @@ function archiveChunk(prepared: Prepared, core: CompressionCore, config: Config)
     let bestBytes = 0;
     const units = completeUnits(prepared.originalMessages as BiliMessage[]);
     const indexes = new Map(prepared.originalMessages.map((message, index) => [message.id, index]));
-    const probeLength = Math.min(config.compress.maxSummaryLength, Math.max(64, config.compress.minSummaryLength));
+    const probeLength = Math.min(config.compress.maxSummaryLength > 0 ? config.compress.maxSummaryLength : Infinity, Math.max(64, config.compress.minSummaryLength));
     const probe = "maintenance-probe:".padEnd(probeLength, "x").slice(0, probeLength);
     for (const range of prepared.nudge?.compressibleRanges ?? []) {
         if (range.dangerous) continue;
@@ -94,7 +103,6 @@ function archiveChunk(prepared: Prepared, core: CompressionCore, config: Config)
         if (start === undefined || end === undefined || end < start) continue;
         const eligible = prepared.originalMessages.slice(start, end + 1) as BiliMessage[];
         if (eligible.some(message => message.imagePart || message.imageBase64 || message.rawOpenaiContentParts || message.rawOpenaiContent)) return undefined;
-        const eligibleIds = new Set(eligible.map(message => message.id));
         let messages: BiliMessage[] = [];
         let source: { role: string; type?: string; tool?: string; toolCallId?: string; content?: string }[] = [];
         let bytes = 2;
@@ -109,8 +117,12 @@ function archiveChunk(prepared: Prepared, core: CompressionCore, config: Config)
             }
             messages = []; source = []; bytes = 2;
         };
-        for (const unit of units) {
-            if (!unit.every(message => eligibleIds.has(message.id))) { keep(); continue; }
+        let lo = 0, hi = units.length;
+        while (lo < hi) { const mid = (lo + hi) >>> 1; if (units[mid].end < start) lo = mid + 1; else hi = mid; }
+        for (let index = lo; index < units.length && units[index].start <= end; index++) {
+            const item = units[index];
+            if (item.ambiguous || item.start < start || item.end > end) { keep(); continue; }
+            const unit = item.messages;
             const entries = unit.map(message => ({ role: message.role, type: message.contentType, tool: message.toolName, toolCallId: message.toolCallId, content: message.text }));
             const entryBytes = Buffer.byteLength(JSON.stringify(entries)) - 2;
             const unsupported = unit.some(message => message.imagePart || message.imageBase64 || message.rawOpenaiContentParts || message.rawOpenaiContent
@@ -152,6 +164,7 @@ export async function maybeRunBoundedMaintenance(args: {
     core: CompressionCore;
     config: Config;
     signal: AbortSignal;
+    hopMarker?: string;
     log: (level: string, message: string) => void;
 }): Promise<boolean> {
     const { prepared, req, opts, core, config, signal, log } = args;
@@ -161,7 +174,7 @@ export async function maybeRunBoundedMaintenance(args: {
     const retry = saved && typeof saved.pending === "boolean" && Number.isInteger(saved.attempts)
         && saved.attempts >= 1 && saved.attempts <= MAX_MAINTENANCE_ATTEMPTS && Number.isFinite(saved.nextAttemptAt) ? saved : undefined;
     const freshNudge = prepared.nudgeOutcome === "injected" && prepared.nudge?.tier === 1;
-    if (!policy || signal.aborted || prepared.protocol !== "openai" || !prepared.pluginMode
+    if (!policy || signal.aborted || attemptedRequests.has(req) || prepared.protocol !== "openai" || !prepared.pluginMode
         || (!freshNudge && !retry?.pending)
         || externalSummaryEnabled(config)) return false;
     if (retry?.pending && (Date.now() < retry.nextAttemptAt || (retry.attempts >= MAX_MAINTENANCE_ATTEMPTS && !freshNudge))) return false;
@@ -178,8 +191,11 @@ export async function maybeRunBoundedMaintenance(args: {
         originals,
     })).digest("hex");
     if (session.metadata.boundedMaintenanceAttempt === signature && !retry?.pending) return false;
-    const target = buildForwardTarget(req, opts, resolveUpstream(opts, req.url ?? "", req));
+    const target = buildForwardTarget(req, opts, resolveUpstream(opts, req.url ?? "", req), undefined, args.hopMarker ?? "bounded-maintenance");
     if (inboundResignCredential(req.headers, opts, target.upstreamUrl) !== undefined) return false;
+    const credential = laneCredential(opts.routes, target.upstreamUrl, message => log("warn", message));
+    if (credential !== undefined) applyLaneCredential(target.headers, credential, message => log("warn", message));
+    attemptedRequests.add(req);
     session.metadata.boundedMaintenanceAttempt = signature;
     const attempt = retry?.pending && retry.attempts < MAX_MAINTENANCE_ATTEMPTS ? retry.attempts + 1 : 1;
     session.metadata.boundedMaintenanceRetry = { pending: true, attempts: attempt, nextAttemptAt: Date.now() + (attempt === 1 ? 30000 : 60000) } satisfies MaintenanceRetry;
@@ -247,10 +263,10 @@ export async function maybeRunBoundedMaintenance(args: {
         if (!parsed.diagnostics.ok || parsed.diagnostics.invalidItems > 0 || parsed.ranges.length !== 1
             || parsed.ranges[0].startRef !== range.startRef || parsed.ranges[0].endRef !== range.endRef) throw new Error("maintenance range mismatch");
         if (deadline.aborted || session.state !== sourceState || session.revisionEpoch !== sourceRevision
-            || !exactCoverage(prepared, core, config, originals, range.startRef, range.endRef, parsed.ranges[0].summary)) throw new Error("maintenance coverage changed");
+            || !exactCoverage(prepared, core, config, originals, range.startRef, range.endRef, parsed.ranges[0].summary, parsed.ranges[0].summaryMaxChars)) throw new Error("maintenance coverage changed");
         stage = "compress";
         const result = await executeProxyToolAsync("compress", { content: input.content }, {
-            core, config, session, messages: prepared.originalMessages,
+            core, config, session, messages: prepared.processedMessages, archiveMessages: prepared.originalMessages,
             compressMessages: prepared.originalMessages,
             log: message => log("info", `[${session.id}] [bounded-maintenance] ${message}`),
         }, undefined, undefined, deadline);

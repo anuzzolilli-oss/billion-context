@@ -23,7 +23,7 @@ import { decodeImageDims } from "./image-tokens.js";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "./compress-tool.js";
 import { matchesOriginalImageReceipt, refForItemBytes, shedDownscaleImage } from "./image-rescale.js";
 import { ResponsesWsUpstreamError } from "./responses-ws.js";
-import { imagePayloadHash, type ImageArchiveReceipt } from "./image-archive-receipt.js";
+import { imagePayloadHash, type ImageArchiveReceipt, type ImageResizeReceipt } from "./image-archive-receipt.js";
 
 type Part = Record<string, unknown>;
 
@@ -56,6 +56,7 @@ interface ShedOptions {
     /** Best-effort mNNNNN resolver (session incoming-image index); placeholders quote it. */
     resolveRef?: (mediaType: string, b64: string) => Promise<string | undefined>;
     onImageArchive?: (receipt: ImageArchiveReceipt) => void | Promise<void>;
+    onImageResize?: (receipt: ImageResizeReceipt) => void | Promise<void>;
 }
 
 interface Occurrence {
@@ -327,6 +328,8 @@ export async function shedWireImages(
                 const smaller = await shedDownscaleImage(o.mediaType, o.b64, dim);
                 if (smaller === null || smaller.length >= o.b64.length) continue;
                 o.applyShrink(smaller);
+                if (opts.onImageResize && o.imageOrdinal !== undefined) await opts.onImageResize({ ordinal: o.imageOrdinal,
+                    mediaType: o.mediaType, sha256: imagePayloadHash(o.b64), resizedBase64: smaller, resizedSha256: imagePayloadHash(smaller) });
                 est += smaller.length - o.b64.length;
                 o.b64 = smaller;
                 downscaled++;
@@ -450,6 +453,7 @@ export async function shedEgressIfOverBudget(
     const { body: next, stats } = await shedWireImages(body, protocol, budget, {
         resolveRef: ctx.session ? (mt, b64) => refForItemBytes(ctx.session!, mt, b64) : undefined,
         onImageArchive: ctx.onImageArchive,
+        onImageResize: ctx.onImageResize,
     });
     if (!stats.changed) {
         ctx.log?.("warn", `[${ctx.sessionId ?? "?"}] [${tag}] ${ctx.phase ?? "send"}: outbound ${formatMiB(originalBytes)} MiB over budget ${formatMiB(budget)} MiB but no sheddable images outside the protected tail — sending as-is`);

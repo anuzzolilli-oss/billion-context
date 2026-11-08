@@ -30,6 +30,8 @@ export type RewriteCtx = {
      *  `messages` view has pruned/hidden content (so block anchors can't
      *  resolve) pass the unpruned log here (billion-context-pi#195). */
     compressMessages?: CoreMessage[];
+    /** Unmodified cache source when the live view has already been shortened. */
+    archiveMessages?: CoreMessage[];
     session: Session;
     log: (msg: string) => void;
     debug?: boolean;
@@ -1306,7 +1308,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // Leaf blocks have no active nested children, so both kernel paths
         // emit byte-identical text — persist a single copy in that case
         // (#401: the duplicate was 50% of blockContents bytes on disk).
-        const contentSource = ctx.messages.length > 0 ? ctx.messages : (ctx.compressMessages ?? ctx.messages);
+        const contentSource = ctx.archiveMessages ?? (ctx.messages.length > 0 ? ctx.messages : (ctx.compressMessages ?? ctx.messages));
         for (const b of res.state.blocks) {
             if (beforeIds.has(b.blockId)) continue;
             const full = collectBlockContent(res.state, b, contentSource, { full: true });

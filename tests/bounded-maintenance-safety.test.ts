@@ -3,12 +3,12 @@ import test from 'node:test';
 import http from 'node:http';
 import { once } from 'node:events';
 import { Socket, type AddressInfo } from 'node:net';
-import { createCore, defaultConfig, assignRefs, emptyRefMap, prune, truncateLargeToolOutputs, defaultCountTokens, type CoreMessage } from 'acp-kernel';
+import { countMessageTokens, createCore, defaultConfig, assignRefs, emptyRefMap, prune, truncateLargeToolOutputs, defaultCountTokens, type CoreMessage } from 'acp-kernel';
 import { createSession } from '../src/session.js';
-import { loadOptions } from '../src/config.js';
+import { loadOptions, type ProxyOptions } from '../src/config.js';
 import { SessionStore, _setStoreForTest } from '../src/persist.js';
 import { configureBoundedMaintenance, maybeRunBoundedMaintenance } from '../src/server/bounded-maintenance.js';
-import { stripKernelSummaries, type Prepared } from '../src/server.js';
+import { startServer, stripKernelSummaries, type Prepared } from '../src/server.js';
 import { executeProxyToolAsync } from '../src/loop/core.js';
 
 process.env.NODE_ENV = 'test';
@@ -35,29 +35,43 @@ function prepared(ctx: ReturnType<typeof fixture>, startIndex: number, endIndex:
         nudgeOutcome: 'injected', nudge: { tier: 1, compressibleRanges: [{ startIndex, endIndex, startRef: refs[processed[startIndex].id], endRef: refs[processed[endIndex].id] }] },
     } as Prepared;
 }
-async function run(ctx: ReturnType<typeof fixture>, p: Prepared, callId = 'hidden-maintenance', beforeReply?: () => void) {
+async function run(ctx: ReturnType<typeof fixture>, p: Prepared, callId = 'hidden-maintenance', beforeReply?: () => void,
+    settings: { credential?: boolean; content?: string; incoming?: http.IncomingMessage; chain?: boolean } = {}) {
     let request: MaintenanceRequest | undefined;
+    let capturedHeaders: http.IncomingHttpHeaders | undefined;
     const logs: string[] = [];
     const server = http.createServer(async (req, res) => {
         const chunks: Buffer[] = [];
         for await (const chunk of req) chunks.push(Buffer.from(chunk));
         request = JSON.parse(Buffer.concat(chunks).toString()) as MaintenanceRequest;
+        capturedHeaders = req.headers;
         const span = /exactly (m\d+–m\d+)/.exec(request.messages[1].content)?.[1];
         beforeReply?.();
         res.setHeader('content-type', 'application/json');
-        res.end(JSON.stringify({ choices: [{ finish_reason: 'tool_calls', message: { tool_calls: [{ id: callId, type: 'function', function: { name: 'compress', arguments: JSON.stringify({ content: `${span} Fixture archive\n${summary}` }) } }] } }] }));
+        res.end(JSON.stringify({ choices: [{ finish_reason: 'tool_calls', message: { tool_calls: [{ id: callId, type: 'function', function: { name: 'compress', arguments: JSON.stringify({ content: settings.content ?? `${span} Fixture archive\n${summary}` }) } }] } }] }));
     });
     server.listen(0, '127.0.0.1'); await once(server, 'listening');
-    const target = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-    const opts = { ...loadOptions(), passthrough: false, autoUpdate: false };
+    let target = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    let downstream: http.Server | undefined;
+    if (settings.chain) {
+        downstream = await startServer({ ...loadOptions(), host: '127.0.0.1', port: 0, log: false, debug: false,
+            autoUpdate: false, advisoryCheck: false, releaseNotesCheck: false, mitm: { enabled: false, domains: [] } });
+        await once(downstream, 'listening');
+        target = `http://127.0.0.1:${(downstream.address() as AddressInfo).port}/bili/${target}`;
+    }
+    const opts: ProxyOptions = { ...loadOptions(), passthrough: false, autoUpdate: false,
+        ...(settings.credential ? { routes: { [target]: { apiKeyEnv: 'BILI_REVIEW_FIXTURE_KEY' } } } : {}) };
     configureBoundedMaintenance(opts, { boundedMaintenance: { timeoutMs: 15000 } });
-    const incoming = new http.IncomingMessage(new Socket());
+    const incoming = settings.incoming ?? new http.IncomingMessage(new Socket());
     incoming.url = `/bili/${target}/v1/chat/completions`;
     try {
         const applied = await maybeRunBoundedMaintenance({ prepared: p, req: incoming,
             opts, core: ctx.core, config: ctx.config, signal: new AbortController().signal, log: (_level, text) => logs.push(text) });
-        return { applied, request, logs, receipt: ctx.session.metadata.boundedMaintenanceLast };
-    } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+        return { applied, request, capturedHeaders, logs, receipt: ctx.session.metadata.boundedMaintenanceLast };
+    } finally {
+        if (downstream) { downstream.closeAllConnections(); await new Promise<void>(resolve => downstream!.close(() => resolve())); }
+        server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
+    }
 }
 function record(finding: number, details: unknown) {
     console.log(`FINDING_${finding} ${JSON.stringify(details)}`);
@@ -98,6 +112,11 @@ test('finding 2: post-fold range indexes must select advertised originals', asyn
     const p = prepared(ctx, start, end, visible);
     p.nudge = { ...turn.nudge!, tier: 1, compressibleRanges: [recommended] };
     const result = await run(ctx, p);
+    assert.equal(result.applied, true, 'the new advertised originals actually create a second block');
+    assert.equal(ctx.session.state.blocks.length, 2);
+    const liveTokens = visible.reduce((total, message) => total + countMessageTokens(message), 0);
+    assert.ok(ctx.session.lastCompress);
+    assert.equal(ctx.session.lastCompress.shrinkRatio, Math.min(1, ctx.session.lastCompress.tokensCompressed / liveTokens));
     const source = result.request?.messages[1].content ?? '';
     record(2, { advertisedRefs: [recommended.startRef, recommended.endRef], kernelRecommendedIndexes: [recommended.startIndex, recommended.endIndex], transformedIndexes: [start, end], originalIdsAtThoseIndexes: messages.slice(start, end + 1).map(m => m.id), suppliedNewA: source.includes('ADVERTISED-NEW-A'), suppliedNewB: source.includes('ADVERTISED-NEW-B'), suppliedEarlier: source.includes('EARLIER-'), receipt: result.receipt });
     assert.ok(source.includes('ADVERTISED-NEW-A') && source.includes('ADVERTISED-NEW-B') && !source.includes('EARLIER-'), 'maintenance selected a different archive than the advertised refs');
@@ -117,6 +136,7 @@ test('finding 3: full decompress must retain original middle after preparation s
     const blockId = ctx.session.state.blocks[0].blockId;
     const restore = await executeProxyToolAsync('decompress', { blockId, full: true }, { ...ctx, messages: processed });
     const cached = ctx.session.blockContents.get(blockId);
+    assert.ok(cached?.full.text.includes(messages[1].text!), 'the cached archive preserves the entire original');
     ctx.session.blockContents.delete(blockId);
     const uncached = await executeProxyToolAsync('decompress', { blockId, full: true }, { ...ctx, messages: processed });
     assert.ok(uncached.text.includes(marker), 'control: originals remain retrievable when the bad cache is bypassed');
@@ -156,6 +176,7 @@ test('finding 5: serialized same-tool parallel results must preserve pairing IDs
     assert.ok(result.request);
     const text = result.request.messages[1].content as string;
     const archive = JSON.parse(text.slice(text.indexOf('\n') + 1)) as ArchiveEntry[];
+    assert.deepEqual(archive.filter(m => m.type !== 'text').map(m => m.toolCallId), ['pair-A', 'pair-B', 'pair-B', 'pair-A']);
     const alternateMessages = messages.map(m => m.contentType === 'tool-result' ? { ...m, toolCallId: m.toolCallId === 'pair-A' ? 'pair-B' : 'pair-A' } : m);
     const alternate = fixture(alternateMessages);
     const alternateResult = await run(alternate, prepared(alternate, 0, 4));
@@ -232,4 +253,81 @@ test('missing advertised endpoint refs cannot fall back to positional indexes', 
     assert.equal(result.request, undefined);
     assert.equal(result.applied, false);
     assert.equal(ctx.session.state.blocks.length, 0);
+});
+
+test('unlimited summary length keeps maintenance enabled', async () => {
+    const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+    ctx.config.compress.maxSummaryLength = 0;
+    assert.equal((await run(ctx, prepared(ctx, 0, 0))).applied, true);
+});
+
+test('complete parsed summary length override survives final coverage preview', async () => {
+    const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+    ctx.config.compress.maxSummaryLength = 100;
+    const ref = ctx.session.state.messageRefs.byRaw.old;
+    const content = JSON.stringify([{ startId: ref, endId: ref, summary: 's'.repeat(150), summaryMaxChars: 200 }]);
+    assert.equal((await run(ctx, prepared(ctx, 0, 0), undefined, undefined, { content })).applied, true);
+});
+
+test('maintenance uses route credential overrides and marks processing ownership', async () => {
+    const old = process.env.BILI_REVIEW_FIXTURE_KEY;
+    process.env.BILI_REVIEW_FIXTURE_KEY = 'disposable-fixture-key';
+    try {
+        const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+        const result = await run(ctx, prepared(ctx, 0, 0), undefined, undefined, { credential: true });
+        assert.equal(result.capturedHeaders?.authorization, 'Bearer disposable-fixture-key');
+        assert.ok(result.capturedHeaders?.['x-bili-hop']);
+    } finally { if (old === undefined) delete process.env.BILI_REVIEW_FIXTURE_KEY; else process.env.BILI_REVIEW_FIXTURE_KEY = old; }
+});
+
+test('one incoming request cannot retry maintenance even after cooldown expires', async () => {
+    const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+    const incoming = new http.IncomingMessage(new Socket());
+    await run(ctx, prepared(ctx, 0, 0), undefined, undefined, { incoming, content: 'invalid range' });
+    ctx.session.metadata.boundedMaintenanceRetry = { pending: true, attempts: 1, nextAttemptAt: 0 };
+    const retry = await run(ctx, prepared(ctx, 0, 0), undefined, undefined, { incoming });
+    assert.equal(retry.request, undefined);
+    assert.equal(ctx.session.state.blocks.length, 0);
+});
+
+test('a chained listener passes maintenance through without a second processing pass', async () => {
+    const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+    const result = await run(ctx, prepared(ctx, 0, 0), undefined, undefined, { chain: true });
+    assert.equal(result.applied, true);
+    assert.equal(result.request?.messages.length, 2);
+    assert.ok(result.request?.messages[1].content.startsWith('[bili-bounded-maintenance]'));
+});
+
+test('reused call IDs do not prevent independent neighboring text from folding', async () => {
+    const messages: CoreMessage[] = [msg('seed', 'Disposable introduction', 'user'),
+        { id: 'call-a', role: 'assistant', contentType: 'tool-call', toolName: 'read', toolCallId: 'reused', text: '{}' },
+        { id: 'result-a', role: 'tool', contentType: 'tool-result', toolName: 'read', toolCallId: 'reused', text: 'first result' },
+        msg('neighbor', 'SAFE-INDEPENDENT '.repeat(500), 'user'),
+        { id: 'call-b', role: 'assistant', contentType: 'tool-call', toolName: 'read', toolCallId: 'reused', text: '{}' },
+        { id: 'result-b', role: 'tool', contentType: 'tool-result', toolName: 'read', toolCallId: 'reused', text: 'z'.repeat(40000) }, ...tail()];
+    const ctx = fixture(messages);
+    const result = await run(ctx, prepared(ctx, 1, 5));
+    assert.ok(result.applied);
+    assert.deepEqual(ctx.session.state.blocks[0].effectiveMessageIds, ['neighbor']);
+});
+
+test('an undersized byte-heavy fragment cannot displace a viable archive', async () => {
+    const messages = [msg('small', '漢'.repeat(4000), 'user'), msg('oversized', 'z'.repeat(40000)),
+        msg('viable', 'VIABLE '.repeat(900), 'user'), ...tail()];
+    const ctx = fixture(messages);
+    const result = await run(ctx, prepared(ctx, 0, 2));
+    assert.ok(result.applied);
+    assert.deepEqual(ctx.session.state.blocks[0].effectiveMessageIds, ['viable']);
+});
+
+test('all assistant companions of reasoning remain complete without swallowing safe neighbors', async () => {
+    const messages: CoreMessage[] = [msg('safe', 'SAFE-NEIGHBOR '.repeat(450), 'user'),
+        { id: 'reason', role: 'assistant', contentType: 'reasoning', text: 'reason '.repeat(100) },
+        msg('prose', 'companion '.repeat(1500)),
+        { id: 'call', role: 'assistant', contentType: 'tool-call', toolName: 'read', toolCallId: 'reason-pair', text: '{}' },
+        { id: 'result', role: 'tool', contentType: 'tool-result', toolName: 'read', toolCallId: 'reason-pair', text: 'r'.repeat(30000) }, ...tail()];
+    const ctx = fixture(messages);
+    const result = await run(ctx, prepared(ctx, 0, 4));
+    assert.ok(result.applied);
+    assert.deepEqual(ctx.session.state.blocks[0].effectiveMessageIds, ['safe']);
 });

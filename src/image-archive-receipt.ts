@@ -10,6 +10,16 @@ export interface ImageArchiveReceipt {
     note: string;
 }
 
+export interface ImageResizeReceipt {
+    ordinal: number;
+    mediaType: string;
+    sha256: string;
+    resizedBase64: string;
+    resizedSha256: string;
+}
+
+export type ImageTransformReceipt = ImageArchiveReceipt | ImageResizeReceipt;
+
 export function imagePayloadHash(base64: string): string {
     return createHash("sha256").update(Buffer.from(base64, "base64")).digest("hex");
 }
@@ -25,17 +35,25 @@ export function sameImage(a: CoreMessage, b: CoreMessage): boolean {
     return JSON.stringify(left.rawOpenaiContent) === JSON.stringify(right.rawOpenaiContent);
 }
 
-export function projectImageArchives(messages: readonly CoreMessage[], batches: readonly (readonly ImageArchiveReceipt[])[]): CoreMessage[] | undefined {
+export function projectImageArchives(messages: readonly CoreMessage[], batches: readonly (readonly ImageTransformReceipt[])[]): CoreMessage[] | undefined {
     let expected = [...messages];
     for (const batch of batches) {
         const positions = expected.flatMap((m, index) => (m as BiliMessage).imagePart ? [index] : []);
         const claimed = new Set<number>();
         for (const receipt of batch) {
             if (!Number.isInteger(receipt.ordinal) || receipt.ordinal < 0 || receipt.ordinal >= positions.length || claimed.has(receipt.ordinal)) return undefined;
-            if (!/^m\d+$/.test(receipt.ref) || !/^image\/[a-zA-Z0-9.+-]+$/.test(receipt.mediaType)) return undefined;
+            if (!/^image\/[a-zA-Z0-9.+-]+$/.test(receipt.mediaType)) return undefined;
             const index = positions[receipt.ordinal];
             const image = expected[index] as BiliMessage;
             if (typeof image.imageBase64 !== "string" || image.imageMediaType !== receipt.mediaType || imagePayloadHash(image.imageBase64) !== receipt.sha256) return undefined;
+            if ("resizedBase64" in receipt) {
+                if (typeof receipt.resizedBase64 !== "string" || !receipt.resizedBase64 || receipt.resizedBase64.length >= image.imageBase64.length
+                    || imagePayloadHash(receipt.resizedBase64) !== receipt.resizedSha256) return undefined;
+                const resized: BiliMessage = { ...image, imageBase64: receipt.resizedBase64 };
+                expected[index] = resized;
+                continue;
+            }
+            if (!/^m\d+$/.test(receipt.ref)) return undefined;
             if (!receipt.note.startsWith(`[image: ${receipt.mediaType.slice(6)} `) || !receipt.note.endsWith(` ${receipt.ref} omitted for size limit]`)) return undefined;
             expected[index] = { id: image.id, role: image.role, contentType: "text", text: receipt.note };
             claimed.add(receipt.ordinal);

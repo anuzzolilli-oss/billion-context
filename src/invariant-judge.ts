@@ -48,7 +48,7 @@ import { openaiToCore, anthropicToCore, responsesToCore, googleToCore } from "ac
 import { log as loggerLog } from "./logger.js";
 import { invariantJudgeEnabled } from "./knobs.js";
 import { normalizeEchoArtifacts } from "./loop/tag-echo-filter.js";
-import { projectImageArchives, sameImage, type ImageArchiveReceipt } from "./image-archive-receipt.js";
+import { projectImageArchives, sameImage, type ImageTransformReceipt } from "./image-archive-receipt.js";
 
 // `<acp tokens="N" type="T">ref</acp>`; angle brackets hex-escaped per KDD#2.
 // An optional leading newline is consumed too — the renderer injects the tag on
@@ -94,7 +94,7 @@ export interface JudgeVerdict {
 }
 
 interface JudgeOptions {
-  imageArchiveBatches?: readonly (readonly ImageArchiveReceipt[])[];
+  imageArchiveBatches?: readonly (readonly ImageTransformReceipt[])[];
   /** Trusted kernel projection from recorded active folds; validate every
    *  surviving cell and the carrier, including cells preceding a tail anchor. */
   expectedFoldedMessages?: readonly CoreMessage[];
@@ -297,7 +297,7 @@ export function judgeInboundOutbound(
   const imageProjection = projectImageArchives(entry, opts.imageArchiveBatches ?? []);
   if (imageProjection !== undefined) entry = imageProjection;
   const equal = (a: CoreMessage, b: CoreMessage): boolean => projection !== undefined
-      && (isSummaryCarrier(a) || (a.contentType === "tool-call" && isCompressToolName(a.toolName)))
+      && ((a.contentType === "text" && a.role !== "tool" && isSummaryCarrier(a)) || (a.contentType === "tool-call" && isCompressToolName(a.toolName)))
     ? a.role === b.role && a.contentType === b.contentType
       && (a.contentType !== "tool-call" || a.toolName === b.toolName)
       && (a.text ?? "").replace(RENDER_TAG_RE, "").trim() === (b.text ?? "").replace(RENDER_TAG_RE, "").trim()
@@ -473,7 +473,7 @@ export function judgeInboundOutbound(
 // never mutates the body or throws out. Owner design: #3842, enablement
 // decision recorded in #3938.
 interface InvariantJudgeInput {
-  imageArchiveBatches?: readonly (readonly ImageArchiveReceipt[])[];
+  imageArchiveBatches?: readonly (readonly ImageTransformReceipt[])[];
   /** Captured under the prepare lock, never supplied by the client or derived
    *  from actual outbound bytes. */
   expectedFoldedMessages?: readonly CoreMessage[];
@@ -551,13 +551,13 @@ export function _setInvariantJudgeFaultForTest(fn?: Fault | null): void {
   fault = fn ?? null;
 }
 
-function armed(): boolean {
+export function invariantJudgeArmed(): boolean {
   if (armedOverride !== null) return armedOverride;
   return invariantJudgeEnabled();
 }
 
 export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
-  if (!armed()) return;
+  if (!invariantJudgeArmed()) return;
   try {
     const entry = input.originalMessages ?? [];
     const exitCores0 = parseExitCores(input.body, input.protocol, input.parsed);
@@ -586,7 +586,7 @@ export function maybeJudgeContinuity(
   protocol: string | undefined,
   sessionId?: string,
 ): void {
-  if (!armed() || !prev) return;
+  if (!invariantJudgeArmed() || !prev) return;
   try {
     const entry = parseExitCores(prev, protocol);
     const exitCores0 = parseExitCores(body, protocol);

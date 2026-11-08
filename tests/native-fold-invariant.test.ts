@@ -51,3 +51,12 @@ test("native summary corruption and missing protected content remain violations"
     ]) assert.equal(judgeInboundOutbound([old, ...nativeExpected], exit, { expectedFoldedMessages: nativeExpected }).ok, false);
     assert.equal(judgeInboundOutbound([old, ...nativeExpected], nativeExpected).ok, false);
 });
+
+test("a tool result quoting the summary marker retains verified truncation handling", () => {
+    const call: CoreMessage = { id: "read-call", role: "assistant", contentType: "tool-call", toolName: "read", toolCallId: "quoted-marker", text: "{}" };
+    const result: CoreMessage = { id: "read-result", role: "tool", contentType: "tool-result", toolName: "read", toolCallId: "quoted-marker", text: "FILE-HEAD [Compressed conversation section] " + "source ".repeat(1000) + " FILE-TAIL" };
+    const clipped = { ...result, text: "FILE-HEAD\n...[truncated for context space] original...\nFILE-TAIL" };
+    const expected = [summary, call, result, recent];
+    assert.equal(judgeInboundOutbound(expected, [summary, call, clipped, recent], { expectedFoldedMessages: expected }).ok, true);
+    assert.equal(judgeInboundOutbound(expected, [summary, call, { ...clipped, text: "CORRUPTED" }, recent], { expectedFoldedMessages: expected }).ok, false);
+});

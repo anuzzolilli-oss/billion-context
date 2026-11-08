@@ -220,6 +220,7 @@ export interface LoopCtx {
     messages: CoreMessage[];
     /** View handed to applyCompression (see RewriteCtx.compressMessages). */
     compressMessages?: CoreMessage[];
+    archiveMessages?: CoreMessage[];
     session: Session;
     reply?: HandoffReply;
     log: (msg: string) => void;

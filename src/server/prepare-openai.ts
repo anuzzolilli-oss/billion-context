@@ -1,6 +1,6 @@
 import http from "node:http";
 import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
-import { isRenderedSummaryMessage, prune, renderNudgeText, viableRanges } from "acp-kernel";
+import { hideConsumedCompressCalls, hideAbsorbedMessages, isRenderedSummaryMessage, prune, renderNudgeText, viableRanges } from "acp-kernel";
 import { coreToOpenai, injectOpenaiSystem, openaiToCore, type BiliMessage, type OpenAIRequestBody, type OpenAITool } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
@@ -85,6 +85,7 @@ export async function prepareOpenai(
     // core.processTurn — see planReasoningDrop for why the post-turn view is
     // too late (the kernel hides consumed call+result pairs inside it).
     let reasoningPlan = new Set<string>();
+    let expectedFoldedView: BiliMessage[] | undefined;
     let attachedRetrievals: PendingRetrieval[] = [];
     let attachedRetrievalNoteIds: string[] = [];
     let originalMessages: CoreMessage[] = [];
@@ -391,6 +392,13 @@ export async function prepareOpenai(
         });
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
         processedMessages = applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId);
+        if (pluginMode && judgeBaseline === undefined && turn.state.blocks.some(block => block.active)) {
+            const pruned = prune([...originalMessages], turn.state, { isCompressTool: loopConfig.isCompressTool });
+            const hidden = hideConsumedCompressCalls(turn.state, pruned, loopConfig.isCompressTool).messages;
+            const absorbed = applyAbsorbView(hideAbsorbedMessages(hidden, turn.state), turn.state, loopConfig, tokenCount);
+            const decorated = attachSubagentSessions(absorbed, session);
+            expectedFoldedView = applyReasoningDrop(stripKernelSummaries(decorated, turn.state), reasoningPlan, log, sessionId) as BiliMessage[];
+        }
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
         // deactivated the blocks whose sources left the context. Skipped when
@@ -642,9 +650,8 @@ export async function prepareOpenai(
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
     let expectedFoldedMessages: CoreMessage[] | undefined;
-    if (pluginMode && judgeBaseline === undefined
-        && (processedMessages.some(isRenderedSummaryMessage) || session.state.blocks.some(block => block.active))) {
-        const foldedView = prune([...originalMessages], session.state) as BiliMessage[];
+    if (expectedFoldedView !== undefined) {
+        const foldedView = [...expectedFoldedView, ...attachedRetrievals.map(item => item.injection)] as BiliMessage[];
         const imageView = await applyImageRescalePass(foldedView, { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
         expectedFoldedMessages = openaiToCore({ ...parsed, messages: coreToOpenai(systemToUser(imageView, isRenderedSummaryMessage)) }).msgs;
     }

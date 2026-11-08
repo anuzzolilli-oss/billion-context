@@ -17,15 +17,36 @@ The kernel remains authoritative for actual fold eligibility and effective cover
 The original run had five causal safety-assertion failures and a passing normal-maintenance control. Each finding then passed the same target after its repair. The resulting tests are retained in `tests/bounded-maintenance-safety.test.ts` (ten scenarios, including complete and oversized reasoning/tool units, source revision changes and missing refs).
 
 ```sh
-node --import tsx --test tests/bounded-maintenance-safety.test.ts tests/bounded-maintenance.test.ts tests/native-call-carrier-e2e.test.ts tests/native-fold-invariant.test.ts tests/image-archive-judge.test.ts tests/image-archive-relay.test.ts
+node --import ./tests/preload-test-env.mjs --import tsx --test tests/bounded-maintenance-safety.test.ts tests/bounded-maintenance.test.ts tests/native-call-carrier-e2e.test.ts tests/native-fold-invariant.test.ts tests/image-archive-judge.test.ts tests/image-archive-relay.test.ts
 npm run typecheck
 npm run build
 ```
 
-Result: **58 tests passed**, no failures or skips; typecheck and build passed. Checks execute actual maintenance, kernel, truncate, archive-cache, summary-strip and decompress paths using disposable in-memory sessions and a loopback fake model service. They do not contact a paid model or modify live proxy state.
+Initial result: **58 tests passed**, no failures or skips; typecheck and build passed. Those earlier commands omitted the repository isolation preload and could write default logs or plugin-conversation maps despite the disabled SessionStore. The earlier claim that all state was isolated was too broad. No cleanup of ambient state is claimed. The corrected command above forces disposable temporary filesystem roots and contacts only loopback fake model services.
 
-The originating task retains the original RED logs, per-finding GREEN logs, combined targeted output and repair contract in its local `inspection-evidence/` directory. Regression tests do not write artifacts outside the checkout.
+The originating task retains original RED logs, per-finding GREEN logs, combined targeted output and repair contract in its local `inspection-evidence/` directory. The hermetic preload deliberately creates temporary directories; tests can write disposable state there.
 
 ## Limits
 
-This patch repairs findings 1–5. Other review findings remain to be triaged. It does not repair already-shortened persisted block caches, migrate existing blocks, rebase the branch onto newer master, certify remote CI, or deploy the fix. User-owned fork review remains separate from the running proxy.
+The first patch repaired findings 1–5; the follow-up below addresses the remaining review. Existing shortened persisted block caches have not been migrated. No remote CI or live deployment verdict is implied. User-owned fork review remains separate from the running proxy.
+
+## Remaining-review follow-up
+
+The branch incorporates fork master `3ac3e95c` through a merge commit, retaining published history. Configuration documentation follows master's move into `docs/`; root redirect stubs remain redirects. Kernel changes and version metadata from master are preserved verbatim; this follow-up does not modify kernel source.
+
+| Review concern | Repair and evidence |
+| --- | --- |
+| 6: undersized archive fragments | Kernel previews screen each candidate before ranking. A byte-heavy CJK fragment cannot displace a viable ASCII archive. |
+| 7: provider credential override | Maintenance resolves and applies the same lane credential as relay; a disposable environment-key test checks the received authorization. |
+| 8: downstream reprocessing | Maintenance sets the processing hop marker. A real second proxy listener forwards its two-message archive without processing it again. |
+| 9: same-request overflow retry | A weak request-identity latch spans preparation reentry. Advancing cooldown cannot retry on the same incoming request object. |
+| 10: watchdog cancellation | The decoding/maintenance controller is registered before processing. A real watchdog 504 aborts a delayed side call, creates no block, and does not forward the failed main request. |
+| 11: expected-history decorations | Independent projection uses the configured compress predicate, consumed-call cleanup, absorption, subagent decorations, carrier suppression, reasoning policy and image pass. Decorated OpenCode and native/MCP two-fold tests pass. |
+| 12: quoted summary markers | Ordinary tool results retain verified truncation handling; forged content still fails. |
+| 13: protected-image resizing | Ordered trusted resize receipts carry old/new hashes and the actual smaller pixels. Real PNGs exercise archival plus multiple downscale rungs; changed pixels or omitted evidence still fail. |
+| 14: disabled diagnostics | Receipt collection is gated before file verification. Instrumented relay tests observe zero archive-verification reads with diagnostics off and nonzero reads with diagnostics on; shedding remains active. |
+| 15: request counts | A maintenance rebuild preserves the incoming request count. Wired tests compare request statistics against actual ordinary requests. |
+
+Additional follow-up edges: unlimited summary length keeps a nonempty selection probe; final coverage preview retains `summaryMaxChars`; reused call IDs are treated as ambiguous without swallowing safe neighbors; reasoning groups include later assistant companions; binary search limits unit traversal to each resolved range. Original bytes now have a dedicated cache input, preserving the processed live view for shrink-ratio metrics. Post-fold tests assert successful second-block creation, full cache preservation, complete call/result IDs and the live-view shrink denominator.
+
+Follow-up validation: **141 focused tests passed**, no failures or skips; typecheck and build passed. The broader run completed **162 tests: 154 passed, 8 failed**, all eight during Windows EPERM temporary-directory teardown in `issue1086-chain-self-exemption.test.ts`. One identical case was independently reproduced at unchanged fork master `3ac3e95c`. The focused run excludes that suite; no test assertions or cleanup policy were weakened. This is not a fully green broad-suite or remote CI verdict. Results are retained with the PR and the local follow-up report.

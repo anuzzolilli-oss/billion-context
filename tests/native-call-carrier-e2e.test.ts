@@ -7,10 +7,11 @@ import { startServer } from "../src/server.js";
 import { loadOptions } from "../src/config.js";
 import { SessionStore, _setStoreForTest } from "../src/persist.js";
 import { _setForTest as setRegistryForTest } from "../src/registry.js";
+import { getSession } from "../src/session.js";
 import { _setInvariantJudgeForTest, _setInvariantJudgeFaultForTest, type JudgeVerdict } from "../src/invariant-judge.js";
 
 let sequence = 0;
-async function nativeEcho() {
+async function nativeEcho(decorated = false, mcp = false) {
     const upstream = http.createServer(async (req, res) => {
         for await (const _chunk of req) { /* Drain the disposable request. */ }
         res.writeHead(200, { "content-type": "application/json" });
@@ -37,7 +38,7 @@ async function nativeEcho() {
     messages.push({ role: "user", content: "PROTECTED-WORK: preserve current requirements." });
     const send = async () => {
         const response = await fetch(`${origin}/bili/${target}/v1/chat/completions`, {
-            method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "pi", "x-bili-plugin-conversation": cid, "x-bili-plugin-context-window": "200000" },
+            method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": decorated ? "opencode" : "pi", "x-bili-plugin-conversation": cid, "x-bili-plugin-context-window": "200000" },
             body: JSON.stringify({ model: "native-fixture", stream: false, max_tokens: 2048, messages,
                 tools: [{ type: "function", function: { name: "read_fixture", description: "Read fixture", parameters: { type: "object", properties: {} } } }],
             }),
@@ -64,7 +65,10 @@ async function nativeEcho() {
             const id = `compress-${fold}`;
             const result = await invoke("compress", args, id);
             assert.equal(result.outcome, "applied", result.result);
-            messages.push({ role: "assistant", content: null, tool_calls: [{ id, type: "function", function: { name: "compress", arguments: JSON.stringify(args) } }] }, { role: "tool", tool_call_id: id, content: result.result });
+            if (decorated) {
+                const session = getSession(cid);
+                session.metadata.subagentSessions = Object.fromEntries(session.state.blocks.map(block => [block.blockId, ["ses_disposable"]]));
+            } else messages.push({ role: "assistant", content: null, tool_calls: [{ id, type: "function", function: { name: mcp ? "mcp__bili__compress" : "compress", arguments: JSON.stringify(args) } }] }, { role: "tool", tool_call_id: id, content: result.result });
             await send();
         }
         await send();
@@ -73,6 +77,26 @@ async function nativeEcho() {
         upstream.closeAllConnections(); await new Promise<void>(resolve => upstream.close(() => resolve()));
     }
 }
+
+test("decorated OpenCode summary anchors remain clean across two folds", async () => {
+    const verdicts: JudgeVerdict[] = [];
+    _setInvariantJudgeForTest(true, verdict => verdicts.push(verdict));
+    try {
+        await nativeEcho(true);
+        assert.ok(verdicts.some(v => v.folded));
+        assert.ok(verdicts.every(v => v.ok), JSON.stringify(verdicts.filter(v => !v.ok)));
+    } finally { _setInvariantJudgeForTest(true); }
+});
+
+test("MCP compression carriers and consumed calls remain clean across two folds", async () => {
+    const verdicts: JudgeVerdict[] = [];
+    _setInvariantJudgeForTest(true, verdict => verdicts.push(verdict));
+    try {
+        await nativeEcho(false, true);
+        assert.ok(verdicts.some(v => v.folded));
+        assert.ok(verdicts.every(v => v.ok), JSON.stringify(verdicts.filter(v => !v.ok)));
+    } finally { _setInvariantJudgeForTest(true); }
+});
 
 for (const fault of ["none", "summary", "protected"] as const) {
     test(`native Pi call/result echo across two folds: ${fault}`, async () => {
