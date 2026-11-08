@@ -1,7 +1,7 @@
 import { fetchWithCodexCatalogCache, isCodexCatalogRequest } from "./codex-catalog-cache.js";
 import { createHandoffReply, captureHandoffJson } from "./handoff-response.js";
 import { checkOutboundBody, OutboundBodyTooLargeError } from "../request-body-budget.js";
-import { maybeRunInvariantJudge } from "../invariant-judge.js";
+import { invariantJudgeArmed, maybeRunInvariantJudge } from "../invariant-judge.js";
 // #1440 P2 cut 4: upstream relay zone (forward) extracted verbatim from src/server.ts — pure move, zero behavior change.
 
 import http from "node:http";
@@ -26,11 +26,12 @@ import { findRoute, resolveDeclaredProtocol, type ProxyOptions } from "../config
 import { makeContinuationRefetch } from "../degenerate-retry.js";
 import { dumpRejectedBody } from "../error-dump.js";
 import { extractWsOversizeError, formatMiB, shedEgressIfOverBudget, shedWireImages, shedWireImagesToCount, type ShedStats, type ShedWireImagesResult } from "../egress-shed.js";
+import type { ImageTransformReceipt } from "../image-archive-receipt.js";
 import { conversationPromptSections, externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
 import { fakeBufCap, injectFakeCompletionHint, isFakeCompletion, maxFakeCompletionRetries } from "../fake-completion.js";
 import { fetchWithTimeout, fetchWithTransportRetry } from "../fetch-util.js";
 import { currentFetchTransport } from "../fetch-transport.js";
-import { refForItemBytes } from "../image-rescale.js";
+import { refForItemBytes, verifyArchivedImageSource } from "../image-rescale.js";
 import { countImagesInParsedBody, countImagesInRawBody, upstreamHost } from "../image-tokens.js";
 import { log as loggerLog } from "../logger.js";
 import { dumpReqAllowed as knobDumpReqAllowed, limitsWsOutboundBytes, rawDumpDir as knobRawDumpDir } from "../knobs.js";
@@ -646,8 +647,19 @@ async function forwardCaptured(
     // (no transport installed); managed non-WS transports pass through untouched
     // (#3701 Finding 1).
     let outboundCopyRewritten = false;
+    const imageArchiveBatches: ImageTransformReceipt[][] = [];
     if (prepared && !prepared.sidePassthrough && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
-        const shed = await shedEgressIfOverBudget(wireBody, prepared.protocol, { sessionId: prepared.session.id, session: prepared.session, log, phase: "pre-send" });
+        const byteArchives: ImageTransformReceipt[] = [];
+        const byteArchiveSession = prepared.session;
+        const collectReceipts = invariantJudgeArmed();
+        const shed = await shedEgressIfOverBudget(wireBody, prepared.protocol, {
+            sessionId: prepared.session.id, session: prepared.session, log, phase: "pre-send",
+            onImageResize: collectReceipts ? receipt => { byteArchives.push(receipt); } : undefined,
+            onImageArchive: collectReceipts ? async receipt => {
+                if (await verifyArchivedImageSource(byteArchiveSession, receipt)) byteArchives.push(receipt);
+            } : undefined,
+        });
+        if (byteArchives.length) imageArchiveBatches.push(byteArchives);
         if (shed.body !== wireBody) outboundCopyRewritten = true;
         wireBody = shed.body;
         // #4124: proactive per-prompt image-count cap — once this route PROVED a
@@ -659,9 +671,14 @@ async function forwardCaptured(
         const imgCap = imgOrigin !== undefined ? prepared.session.stats.imageCountCaps?.[imgOrigin] : undefined;
         if (typeof imgCap === "number" && imgCap > 0) {
             const sess = prepared.session;
+            const countArchives: ImageTransformReceipt[] = [];
             const countShed = await shedWireImagesToCount(wireBody, prepared.protocol, imgCap - 1, {
                 resolveRef: (mt, b64) => refForItemBytes(sess, mt, b64),
+                onImageArchive: collectReceipts ? async receipt => {
+                    if (await verifyArchivedImageSource(sess, receipt)) countArchives.push(receipt);
+                } : undefined,
             });
+            if (countArchives.length) imageArchiveBatches.push(countArchives);
             if (countShed.stats.changed) {
                 outboundCopyRewritten = true;
                 sess.metadata.imageCountShed = { at: Date.now(), phase: "pre-send", cap: imgCap, archived: countShed.stats.archived };
@@ -861,7 +878,8 @@ async function forwardCaptured(
         // (transcript rows + summary carriers), not the raw inbound bytes — the
         // judge must exempt that region and validate only the client tail. The
         // boundary was recorded by prepare's maybeSnapshotView on the same session.
-        const renderTailStart = typeof prepared.session.metadata["snapshotRenderTailStart"] === "number"
+        const renderTailStart = prepared.expectedMediaMessages !== undefined ? prepared.expectedMediaRenderTailStart
+            : typeof prepared.session.metadata["snapshotRenderTailStart"] === "number"
             ? (prepared.session.metadata["snapshotRenderTailStart"] as number)
             : undefined;
         maybeRunInvariantJudge({
@@ -877,6 +895,9 @@ async function forwardCaptured(
             // (reference-inequality); otherwise this is byte-identical to
             // prepared.originalMessages.
             originalMessages: prepared.judgeBaseline ?? prepared.originalMessages,
+            expectedFoldedMessages: prepared.expectedFoldedMessages,
+            expectedMediaMessages: prepared.expectedMediaMessages,
+            imageArchiveBatches,
             body: sentBody,
             protocol: prepared.protocol,
             sessionId: prepared.session.id,

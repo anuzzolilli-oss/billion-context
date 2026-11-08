@@ -8,10 +8,12 @@
 
 billion-context/
 ├── src/
+│   ├── image-archive-receipt.ts  # Per-request OpenAI archival/resize receipts and hash-verified expected media projection
 │   ├── index.ts                  # Entry point: runs cli.ts main()
 │   ├── cli.ts                    # CLI dispatcher: start/update/export/test/plugin + client launcher
 │   ├── server.ts                 # HTTP proxy server, request pipeline (hot file — §7.2)
 │   ├── server/                   # Server-side support modules
+│   │   ├── bounded-maintenance.ts #   Opt-in embedded OpenAI native-agent maintenance turn; named-tool bound, verified block creation, protected engine execution
 │   │   ├── admin.ts              #   /__bili/* + /__acp/* admin route surface (stats/status/overview/sessions/detail/logs/config/plugin/watcher/upstream endpoints), loopback + trusted-origin gated (#1440)
 │   │   ├── budget.ts             #   chars/4 overhead measure outside the kernel fold space
 │   │   ├── chain-artifacts.ts    #   Allocation-free byte pre-filter for chain artifacts (#1421)
@@ -26,6 +28,7 @@ billion-context/
 │   │   ├── prepare-anthropic.ts  #   Anthropic request preparation (fold → rebuild → system/nudge injection) (#1440)
 │   │   ├── prepare-google.ts     #   Gemini request preparation incl. :countTokens twin (#1440)
 │   │   ├── prepare-openai.ts     #   OpenAI chat request preparation (#1440)
+│   │   ├── judge-media-projection.ts # Independent expected media view + snapshot seam mapping
 │   │   ├── prepare-responses.ts  #   Responses request preparation + codex compact/prompt-cache helpers (#1440)
 │   │   ├── relay.ts             #   Upstream relay zone: forward() + fake-completion recovery (#1440 P2 cut 4)
 │   │   ├── side-request.ts       #   Tool-surface check for auxiliary side requests

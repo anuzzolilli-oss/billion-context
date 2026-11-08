@@ -21,6 +21,8 @@ Every model-traffic request that reaches the proxy passes through this module: i
 
 **Prepare (per-wire).** `prepare-anthropic` / `prepare-openai` / `prepare-responses` / `prepare-google` convert the request to canonical cores (in-flight envelope fields such as host msgids are stripped here — see [identity](./identity.md)), run the fold→rebuild→injection sequence, and place the system message and the nudge where that wire requires it.
 
+**History diagnostics (OpenAI media).** When armed, `judge-media-projection.ts` independently constructs expected media bytes under the preparation lock. A snapshot tail boundary is mapped through resizing and wire merging; a wire cell crossing the seam remains checked in full. Relay passes the captured view/boundary and trusted image-transform receipts to `invariant-judge.ts`. The rendered prefix is exempt from tail fidelity, while changed live text or pixels fail. This diagnostic path never derives its expected bytes from the actual outbound body and never changes that body.
+
 **Kernel.** The canonical cores plus the session's `CompressionState` go to acp-kernel; the decision and its artifacts come back — see the [kernel module](./kernel.md).
 
 **Unified loop (`src/loop`).** A protocol-neutral core with four wire adapters performs tool adjudication and the prose tag-echo filter (`tag-echo-filter.ts` — prose only, arguments untouched). This is where the two compression modes keep the same code path (KDD #7): plugin mode suppresses tool + nudge injection because the agent owns compression; proxy mode emits the `acp_summary` carrier, re-voiced as a user message so strict backends keep a stable prefix.

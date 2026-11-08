@@ -1,6 +1,7 @@
 // #1440 P2 cut 3: proxy request pipeline (handle) extracted verbatim from src/server.ts — pure move, zero behavior change.
 
 import http from "node:http";
+import { maybeRunBoundedMaintenance, withBoundedMaintenanceReceipt } from "./bounded-maintenance.js";
 import { Readable } from "node:stream";
 import fs from "node:fs";
 import path from "node:path";
@@ -89,7 +90,7 @@ import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape
 import { handlePluginRender, PLUGIN_RENDER_PATH } from "../plugin-render.js";
 import { ccrPluginWireOk, storeEffectiveCcr, storeEffectiveImageRescale, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
-import { BodyTooLargeError, buildForwardTarget, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnModelNameMissIfNew, warnRouteMissIfNew, type Prepared } from "../server.js";
+import { BodyTooLargeError, buildForwardTarget, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, registerRequestAbort, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnModelNameMissIfNew, warnRouteMissIfNew, type Prepared } from "../server.js";
 import { normalizeVertexModelId } from "../vertex.js";
 import { CREDENTIAL_HEADER_NAMES } from "../cache-ledger.js";
 import { requestModelFromBody } from "../upstream-throttle.js";
@@ -151,6 +152,7 @@ export async function handle(
 ): Promise<void> {
     const admission = new DecodedRequestAdmission();
     const decodingAbort = new AbortController();
+    registerRequestAbort(res, decodingAbort);
     const close = () => { if (!res.writableEnded) decodingAbort.abort(); };
     res.on("close", close);
     try {
@@ -2841,6 +2843,16 @@ async function handleRequest(
                     reqConfig = { ...reqConfig, modelContextLimit: overflowWindow };
                 }
                 prepared = await runPrepare();
+                storeUnpromptedGate(session, {
+                    armed: prepared.nudgeOutcome === "injected",
+                    requireNudge: preparedCs?.requireNudge === true,
+                    requireRecommendation: preparedCs?.requireRecommendation === true,
+                });
+                if (await maybeRunBoundedMaintenance({ prepared, req, opts, core, config: reqConfig, signal: decodingSignal, hopMarker: instanceId, log })) {
+                    const requests = session.stats.requests;
+                    try { prepared = withBoundedMaintenanceReceipt(await runPrepare()); }
+                    finally { session.stats.requests = requests; }
+                }
                 memProbe(opts.debug, log, session.id, "prepared", typeof prepared.body === "string" ? Buffer.byteLength(prepared.body) : prepared.body.byteLength);
                 // #4528: prepare ran the per-turn O(messages) scan passes over
                 // the resent history; yield so UI/API requests queue-drained
@@ -3093,6 +3105,7 @@ async function handleRequest(
                 clearSignedRefusal(guardScheme);
             }
             const pendingForward = await withSessionLock(session, () => runPreparedPipeline(true));
+            if (decodingSignal.aborted || res.writableEnded || res.destroyed) return;
             if (pendingForward) {
                 forwarded = true;
                 // #1195: wire clients (omp/pi on the plain proxy path) treat an

@@ -6,6 +6,19 @@
 
 ---
 
+
+## Experimental embedded maintenance
+
+Embedded test servers can opt into bounded OpenAI-chat native-agent maintenance with the second argument to `startServer`: `{ boundedMaintenance: { timeoutMs: 15000, maxTokens: 1024 } }`. This is a programmatic server API, not a saved configuration field, environment variable or CLI option. Existing startup calls remain disabled by default. Its initial attempt requires a delivered T1 nudge and a declared native `compress` tool, skips callers selecting `tool_choice: "none"`, signed-request routes and external-summary chains, and holds the existing session lock. At most one named-compress model call is allowed per incoming request, with a hard deadline capped at 30 seconds and an output cap of 4096 tokens. Only validated calls for the selected span reach the existing engine; applied outcomes require newly created blocks. Failures continue the original request without an immediate retry. A pending cycle allows three attempts total (initial plus two retries), on later incoming requests after 30- and 60-second cooldowns, independently of reminder growth/cadence. Every retry re-evaluates the current eligible archive and retains all safety gates. Changed archive content alone does not reset an exhausted budget; a new delivered T1 nudge is required for a new cycle. New blocks close the cycle, including partial state changes, which are re-rendered and reported as partial. Client aborts do not schedule automatic retries. Retry state is persisted in session metadata; no background retry timer or new saved setting is introduced. Unsupported protocols and proxy-mode tool interception retain their existing behavior.
+
+The maintenance call contains only the selected text archive and short summarization instructions, requests low reasoning effort on the same model, and defaults to a 1024-token output budget. Ranges carrying opaque or image sidecars are excluded from this text-only optimization. Truncated output is rejected. After verified success the resumed request receives a transient factual completion receipt; normal tools remain available for details absent from summaries. The receipt is not repeated on later turns and cannot be emitted for a failed or no-op fold.
+
+This opt-in may increase latency: measure the maintenance turn separately from later turns, and verify summary quality and original retrieval before deployment. It does not change the kernel's default cadence or protected-history rules.
+
+`billion-context` is an HTTP proxy that injects [ACP](https://github.com/ranxianglei/acp-kernel) (Active Context Pruning) context compression into LLM API streams. Every option below lives in a single JSON config file (or an equivalent environment variable / CLI flag).
+
+---
+
 ## Config File Locations
 
 | Scope | Path | Notes |

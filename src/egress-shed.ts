@@ -23,6 +23,7 @@ import { decodeImageDims } from "./image-tokens.js";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "./compress-tool.js";
 import { matchesOriginalImageReceipt, refForItemBytes, shedDownscaleImage } from "./image-rescale.js";
 import { ResponsesWsUpstreamError } from "./responses-ws.js";
+import { imagePayloadHash, type ImageArchiveReceipt, type ImageResizeReceipt } from "./image-archive-receipt.js";
 
 type Part = Record<string, unknown>;
 
@@ -54,9 +55,12 @@ export interface ShedWireImagesResult {
 interface ShedOptions {
     /** Best-effort mNNNNN resolver (session incoming-image index); placeholders quote it. */
     resolveRef?: (mediaType: string, b64: string) => Promise<string | undefined>;
+    onImageArchive?: (receipt: ImageArchiveReceipt) => void | Promise<void>;
+    onImageResize?: (receipt: ImageResizeReceipt) => void | Promise<void>;
 }
 
 interface Occurrence {
+    imageOrdinal?: number;
     /** Top-level entry index (chronological order). */
     entryIndex: number;
     b64: string;
@@ -80,7 +84,7 @@ function dataUrl(mediaType: string, b64: string): string {
     return `data:${mediaType};base64,${b64}`;
 }
 
-async function shedNote(mediaType: string, b64: string, resolveRef: ShedOptions["resolveRef"]): Promise<string> {
+async function shedNote(mediaType: string, b64: string, resolveRef: ShedOptions["resolveRef"]): Promise<{ note: string; ref?: string }> {
     const mime = mediaType.replace(/^image\//i, "");
     const bits: string[] = [];
     if (mime) bits.push(mime);
@@ -88,7 +92,13 @@ async function shedNote(mediaType: string, b64: string, resolveRef: ShedOptions[
     if (dims) bits.push(`${dims.w}x${dims.h}`);
     const ref = await resolveRef?.(mediaType, b64);
     if (ref) bits.push(ref);
-    return `[image: ${bits.join(" ")} omitted for size limit]`;
+    return { note: `[image: ${bits.join(" ")} omitted for size limit]`, ref };
+}
+
+async function recordArchive(o: Occurrence, note: string, ref: string | undefined, opts: ShedOptions): Promise<void> {
+    if (o.imageOrdinal !== undefined && ref && /^m\d+$/.test(ref)) {
+        await opts.onImageArchive?.({ ordinal: o.imageOrdinal, mediaType: o.mediaType, sha256: imagePayloadHash(o.b64), ref, note });
+    }
 }
 
 /** call_id → tool name, so read_original_image outputs stay exempt (archiving them would
@@ -214,6 +224,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
     const messages = body.messages;
     if (!Array.isArray(messages)) return occ;
     const names = callNameMap(protocol, body);
+    let imageOrdinal = 0;
     messages.forEach((m, entryIndex) => {
         if (!isObj(m)) return;
         if (protocol === "openai" && m.role === "tool" && isExemptOutput(protocol, m, names)) return;
@@ -226,12 +237,14 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
             if (!p) return;
             if (protocol === "openai") {
                 if (p.type !== "image_url") return;
+                const ordinal = m.role === "user" ? imageOrdinal++ : undefined;
                 const iu = p.image_url;
                 const url = typeof iu === "string" ? iu : isObj(iu) && typeof iu.url === "string" ? iu.url : undefined;
                 if (typeof url !== "string") return;
                 const d = parseDataUrl(url);
                 if (!d) return;
                 occ.push({
+                    imageOrdinal: ordinal,
                     entryIndex,
                     b64: d.base64,
                     mediaType: d.mediaType,
@@ -292,8 +305,9 @@ export async function shedWireImages(
     for (const o of occurrences) {
         if (est <= targetBytes) break;
         if (o.protectedTail) continue;
-        const note = await shedNote(o.mediaType, o.b64, opts.resolveRef);
+        const { note, ref } = await shedNote(o.mediaType, o.b64, opts.resolveRef);
         o.applyArchive(note);
+        await recordArchive(o, note, ref, opts);
         o.archived = true;
         // the serialized value being removed is the whole data URL, not the bare base64
         est += byteLen(JSON.stringify(note)) - byteLen(dataUrl(o.mediaType, o.b64));
@@ -314,6 +328,8 @@ export async function shedWireImages(
                 const smaller = await shedDownscaleImage(o.mediaType, o.b64, dim);
                 if (smaller === null || smaller.length >= o.b64.length) continue;
                 o.applyShrink(smaller);
+                if (opts.onImageResize && o.imageOrdinal !== undefined) await opts.onImageResize({ ordinal: o.imageOrdinal,
+                    mediaType: o.mediaType, sha256: imagePayloadHash(o.b64), resizedBase64: smaller, resizedSha256: imagePayloadHash(smaller) });
                 est += smaller.length - o.b64.length;
                 o.b64 = smaller;
                 downscaled++;
@@ -377,8 +393,9 @@ export async function shedWireImagesToCount(
             if (remaining <= maxImages) break;
             if (o.archived) continue;
             if (!allowTail && o.protectedTail) continue;
-            const note = await shedNote(o.mediaType, o.b64, opts.resolveRef);
+            const { note, ref } = await shedNote(o.mediaType, o.b64, opts.resolveRef);
             o.applyArchive(note);
+            await recordArchive(o, note, ref, opts);
             o.archived = true;
             remaining--;
             archived++;
@@ -390,7 +407,7 @@ export async function shedWireImagesToCount(
     return { body: next, stats: { originalBytes, finalBytes: byteLen(next), archived, downscaled: 0, changed: true } };
 }
 
-interface ShedContext {
+interface ShedContext extends ShedOptions {
     sessionId?: string;
     session?: Session;
     log?: (level: string, message: string) => void;
@@ -435,6 +452,8 @@ export async function shedEgressIfOverBudget(
     const metaKey = lane === "ws" ? "wsByteShed" : "httpByteShed";
     const { body: next, stats } = await shedWireImages(body, protocol, budget, {
         resolveRef: ctx.session ? (mt, b64) => refForItemBytes(ctx.session!, mt, b64) : undefined,
+        onImageArchive: ctx.onImageArchive,
+        onImageResize: ctx.onImageResize,
     });
     if (!stats.changed) {
         ctx.log?.("warn", `[${ctx.sessionId ?? "?"}] [${tag}] ${ctx.phase ?? "send"}: outbound ${formatMiB(originalBytes)} MiB over budget ${formatMiB(budget)} MiB but no sheddable images outside the protected tail — sending as-is`);

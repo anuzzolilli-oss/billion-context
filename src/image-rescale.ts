@@ -36,6 +36,7 @@ import { imageRescaleEnabled, imageRescaleMaxDim } from "./knobs.js";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "./compress-tool.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 import type { Session } from "./session.js";
+import type { ImageArchiveReceipt } from "./image-archive-receipt.js";
 import { log, type Logger } from "./logger.js";
 
 /** Trigger gate: longest edge above maxDim OR decoded bytes above this. */
@@ -542,6 +543,17 @@ export async function refForItemBytes(session: Session, mediaType: string, b64: 
         }
     }
     return matched;
+}
+
+export async function verifyArchivedImageSource(session: Pick<Session, "incomingImageIndex">, receipt: ImageArchiveReceipt): Promise<boolean> {
+    for (const entry of session.incomingImageIndex?.get(receipt.ref) ?? []) {
+        if (entry.mediaType !== receipt.mediaType) continue;
+        try {
+            const original = await readFile(entry.path);
+            if (createHash("sha256").update(original).digest("hex") === receipt.sha256) return true;
+        } catch { /* A stale spill entry cannot authorize an exemption. */ }
+    }
+    return false;
 }
 
 /** Egress pass for the responses steady path (see module header). No-op

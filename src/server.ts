@@ -317,12 +317,14 @@ export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.
 // the response — closing the response alone would NOT abort it (the close
 // handler only aborts when !writableEnded), leaving a zombie fetch holding its
 // socket for the full upstream idle timeout.
-const requestAborts = new WeakMap<http.ServerResponse, AbortController>();
+const requestAborts = new WeakMap<http.ServerResponse, Set<AbortController>>();
 
 export function registerRequestAbort(res: http.ServerResponse, ac: AbortController): void {
     // 取消可能已在 preflight 与 relay 交接前发生，close 事件不会重放。
-    if (requestAborts.get(res)?.signal.aborted || res.destroyed || res.writableEnded || res.socket?.destroyed) ac.abort();
-    requestAborts.set(res, ac);
+    let controllers = requestAborts.get(res);
+    if ((controllers && [...controllers].some(controller => controller.signal.aborted)) || res.destroyed || res.writableEnded || res.socket?.destroyed) ac.abort();
+    if (!controllers) { controllers = new Set(); requestAborts.set(res, controllers); }
+    controllers.add(ac);
 }
 
 export function requestWatchdogBudgetMs(): number {
@@ -366,7 +368,7 @@ function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse,
         if (res.writableEnded || res.destroyed || !res.socket || res.socket.destroyed) return;
         const secs = Math.round((Date.now() - startedAt) / 1000);
         log("error", `[watchdog] ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} produced no output for ${secs}s (idle budget ${Math.round(budgetMs / 1000)}s) — closing the request so the client can fail fast instead of hanging forever`);
-        requestAborts.get(res)?.abort();
+        requestAborts.get(res)?.forEach(controller => controller.abort());
         try {
             if (!res.headersSent) {
                 res.writeHead(504, { "content-type": "application/json", "connection": "close" });
@@ -643,7 +645,9 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     };
 }
 
-export async function startServer(opts: ProxyOptions): Promise<http.Server> {
+export async function startServer(opts: ProxyOptions, runtime?: import("./server/bounded-maintenance.js").ServerRuntimeOptions): Promise<http.Server> {
+    const { configureBoundedMaintenance } = await import("./server/bounded-maintenance.js");
+    configureBoundedMaintenance(opts, runtime);
     const launchToken = process.env.BILI_LAUNCH_TOKEN?.trim();
     // #1225: lane identity + code fingerprint recorded into the instance file
     // so later launches can decide reuse by WHO started us and WHICH code we
@@ -1926,6 +1930,10 @@ export type Prepared = {
      *  from the frozen prefix). Undefined = client-authoritative turn, the
      *  judge keeps originalMessages (byte-identical behavior). */
     judgeBaseline?: readonly CoreMessage[];
+    expectedFoldedMessages?: readonly CoreMessage[];
+    expectedMediaMessages?: readonly CoreMessage[];
+    /** Snapshot boundary in expectedMediaMessages coordinates, captured under prepare's lock. */
+    expectedMediaRenderTailStart?: number;
     protocol: WireProtocol;
     stream: boolean;
     compressInjected: boolean;
