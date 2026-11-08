@@ -39,38 +39,89 @@ function measuredIdentifier(value: unknown): string | undefined {
     return typeof value === "string" && /^[\w.:/\-]{1,160}$/.test(value) ? value : undefined;
 }
 
-function archiveChunk(prepared: Prepared) {
+function completeUnits(messages: BiliMessage[]): BiliMessage[][] {
+    const ends = messages.map((_, index) => index);
+    const pairs = new Map<string, number>();
+    let reasoningStart = -1;
+    for (const [index, message] of messages.entries()) {
+        if (message.role === "assistant" && message.contentType === "reasoning") {
+            if (reasoningStart < 0) reasoningStart = index;
+            ends[reasoningStart] = Math.max(ends[reasoningStart], index);
+        } else {
+            if (reasoningStart >= 0 && message.role === "assistant") ends[reasoningStart] = Math.max(ends[reasoningStart], index);
+            reasoningStart = -1;
+        }
+        if (message.toolCallId) {
+            const first = pairs.get(message.toolCallId);
+            if (first === undefined) pairs.set(message.toolCallId, index);
+            else ends[first] = Math.max(ends[first], index);
+        }
+    }
+    const units: BiliMessage[][] = [];
+    for (let start = 0; start < messages.length;) {
+        let end = ends[start];
+        for (let index = start + 1; index <= end; index++) end = Math.max(end, ends[index]);
+        units.push(messages.slice(start, end + 1));
+        start = end + 1;
+    }
+    return units;
+}
+
+function exactCoverage(prepared: Prepared, core: CompressionCore, config: Config,
+    originals: BiliMessage[], startRef: string, endRef: string, summary: string): boolean {
+    try {
+        const before = new Set(prepared.session.state.blocks.map(block => block.blockId));
+        const preview = core.applyCompression({ messages: prepared.originalMessages, state: prepared.session.state, config,
+            ranges: [{ startRef, endRef, summary }] });
+        const created = preview.state.blocks.filter(block => !before.has(block.blockId));
+        if (created.length !== 1) return false;
+        const covered = new Set(created[0].effectiveMessageIds);
+        return covered.size === originals.length && originals.every(message => covered.has(message.id));
+    } catch { return false; }
+}
+
+function archiveChunk(prepared: Prepared, core: CompressionCore, config: Config) {
     let best: { originals: BiliMessage[]; source: string; startRef: string; endRef: string } | undefined;
     let bestBytes = 0;
+    const units = completeUnits(prepared.originalMessages as BiliMessage[]);
+    const indexes = new Map(prepared.originalMessages.map((message, index) => [message.id, index]));
+    const probeLength = Math.min(config.compress.maxSummaryLength, Math.max(64, config.compress.minSummaryLength));
+    const probe = "maintenance-probe:".padEnd(probeLength, "x").slice(0, probeLength);
     for (const range of prepared.nudge?.compressibleRanges ?? []) {
-        if (range.dangerous || range.startIndex === undefined || range.endIndex === undefined) continue;
-        const eligible = prepared.originalMessages.slice(range.startIndex, range.endIndex + 1) as BiliMessage[];
+        if (range.dangerous) continue;
+        const start = indexes.get(prepared.session.state.messageRefs.byRef[range.startRef]);
+        const end = indexes.get(prepared.session.state.messageRefs.byRef[range.endRef]);
+        if (start === undefined || end === undefined || end < start) continue;
+        const eligible = prepared.originalMessages.slice(start, end + 1) as BiliMessage[];
         if (eligible.some(message => message.imagePart || message.imageBase64 || message.rawOpenaiContentParts || message.rawOpenaiContent)) return undefined;
+        const eligibleIds = new Set(eligible.map(message => message.id));
         let messages: BiliMessage[] = [];
-        let source: { role: string; type?: string; tool?: string; content?: string }[] = [];
+        let source: { role: string; type?: string; tool?: string; toolCallId?: string; content?: string }[] = [];
         let bytes = 2;
         const keep = () => {
-            if (messages.length && bytes > bestBytes) {
+            const startRef = messages.length ? prepared.session.state.messageRefs.byRaw[messages[0].id] : undefined;
+            const endRef = messages.length ? prepared.session.state.messageRefs.byRaw[messages[messages.length - 1].id] : undefined;
+            if (messages.length && bytes > bestBytes && startRef && endRef
+                && exactCoverage(prepared, core, config, messages, startRef, endRef, probe)) {
                 bestBytes = bytes;
                 best = { originals: messages, source: JSON.stringify(source),
-                    startRef: prepared.session.state.messageRefs.byRaw[messages[0].id],
-                    endRef: prepared.session.state.messageRefs.byRaw[messages[messages.length - 1].id] };
+                    startRef, endRef };
             }
             messages = []; source = []; bytes = 2;
         };
-        for (const message of eligible) {
-            const rich = message as BiliMessage;
-            const ref = prepared.session.state.messageRefs.byRaw[message.id];
-            const entry = { role: message.role, type: message.contentType, tool: message.toolName, content: message.text };
-            const entryBytes = Buffer.byteLength(JSON.stringify(entry));
-            const unsupported = rich.imagePart || rich.imageBase64 || rich.rawOpenaiContentParts || rich.rawOpenaiContent || !ref;
+        for (const unit of units) {
+            if (!unit.every(message => eligibleIds.has(message.id))) { keep(); continue; }
+            const entries = unit.map(message => ({ role: message.role, type: message.contentType, tool: message.toolName, toolCallId: message.toolCallId, content: message.text }));
+            const entryBytes = Buffer.byteLength(JSON.stringify(entries)) - 2;
+            const unsupported = unit.some(message => message.imagePart || message.imageBase64 || message.rawOpenaiContentParts || message.rawOpenaiContent
+                || !prepared.session.state.messageRefs.byRaw[message.id]);
             if (unsupported || bytes + entryBytes + (source.length ? 1 : 0) > MAX_ARCHIVE_BYTES) {
                 keep();
                 if (unsupported || entryBytes + 2 > MAX_ARCHIVE_BYTES) continue;
             }
             bytes += entryBytes + (source.length ? 1 : 0);
-            messages.push(rich);
-            source.push(entry);
+            messages.push(...unit);
+            source.push(...entries);
         }
         keep();
     }
@@ -119,7 +170,7 @@ export async function maybeRunBoundedMaintenance(args: {
     if (!Array.isArray(body.messages) || !Array.isArray(body.tools)) return false;
     const tool = body.tools.find((t: { type?: string; function?: { name?: string } }) => t?.type === "function" && t.function?.name === "compress") as unknown;
     if (!tool) return false;
-    const range = archiveChunk(prepared);
+    const range = archiveChunk(prepared, core, config);
     if (!range) return false;
     const { originals } = range;
     const signature = createHash("sha256").update(JSON.stringify({
@@ -144,6 +195,8 @@ export async function maybeRunBoundedMaintenance(args: {
     } as Record<string, unknown>;
     for (const key of ["stream_options", "response_format", "max_completion_tokens"]) delete maintenance[key];
     const before = new Set(session.state.blocks.map(b => b.blockId));
+    const sourceState = session.state;
+    const sourceRevision = session.revisionEpoch;
     const started = Date.now();
     let outcome = "failed";
     let blockIds: string[] = [];
@@ -193,12 +246,14 @@ export async function maybeRunBoundedMaintenance(args: {
         const parsed = parseCompressInput({ content: input.content }, undefined, { quiet: true });
         if (!parsed.diagnostics.ok || parsed.diagnostics.invalidItems > 0 || parsed.ranges.length !== 1
             || parsed.ranges[0].startRef !== range.startRef || parsed.ranges[0].endRef !== range.endRef) throw new Error("maintenance range mismatch");
+        if (deadline.aborted || session.state !== sourceState || session.revisionEpoch !== sourceRevision
+            || !exactCoverage(prepared, core, config, originals, range.startRef, range.endRef, parsed.ranges[0].summary)) throw new Error("maintenance coverage changed");
         stage = "compress";
         const result = await executeProxyToolAsync("compress", { content: input.content }, {
-            core, config, session, messages: prepared.processedMessages,
+            core, config, session, messages: prepared.originalMessages,
             compressMessages: prepared.originalMessages,
             log: message => log("info", `[${session.id}] [bounded-maintenance] ${message}`),
-        }, calls[0].id, undefined, deadline);
+        }, undefined, undefined, deadline);
         const created = session.state.blocks.filter(b => !before.has(b.blockId));
         blockIds = created.map(b => b.blockId);
         const applied = result.outcome === "applied" && created.length > 0;
