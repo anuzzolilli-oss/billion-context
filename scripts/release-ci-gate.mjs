@@ -82,6 +82,8 @@
 
 import { appendFileSync } from "node:fs";
 
+class ReleaseGateExit extends Error {}
+
 const DEFAULT_REQUIRED = [
   "ci.yml",
   "ci-e2e.yml",
@@ -314,7 +316,7 @@ async function dispatchMissing(states, targetSha) {
       const body = await res.text().catch(() => "");
       console.error(`::error::dispatch ${wf} at ref ${refName} → HTTP ${res.status}: ${body.slice(0, 300)}`);
       console.error(`::error::${wf} has no run at ${targetSha.slice(0, 8)} and cannot be dispatched (missing workflow_dispatch trigger, or file absent from the default branch). Refusing to publish without it.`);
-      process.exit(1);
+      throw new ReleaseGateExit();
     }
     console.log(`dispatched ${wf} at ref ${refName}${payload.inputs ? " (full scope)" : ""}`);
     fired += 1;
@@ -366,7 +368,7 @@ async function main() {
         `::error::ref ${refName} head is ${head ? head.slice(0, 12) : "unknown"} but the target sha is ${publishSha.slice(0, 12)} — refusing to dispatch: ` +
           `runs would land on the wrong sha where the gate could never see them. Sync the ref to the target sha (or re-cut the release at the current head) and retry.`,
       );
-      process.exit(1);
+      throw new ReleaseGateExit();
     }
     await cancelStaleRuns(publishSha);
     const states = await laneStates(publishSha);
@@ -402,7 +404,7 @@ async function main() {
     if (red.length) {
       printStates(states);
       console.error(`::error::CI lane(s) RED at ${shaLabel}: ${red.join(", ")} — refusing to publish. Re-run the lane(s) or fix, then retry the release.`);
-      process.exit(1);
+      throw new ReleaseGateExit();
     }
     if (required.every((wf) => classify(states[wf]) === "green")) {
       printStates(states);
@@ -413,7 +415,7 @@ async function main() {
       printStates(states);
       const pending = required.filter((wf) => classify(states[wf]) !== "green");
       console.error(`::error::CI gate timed out after ${timeoutMin}min waiting for: ${pending.join(", ")} — refusing to publish.`);
-      process.exit(1);
+      throw new ReleaseGateExit();
     }
     const waiting = required.filter((wf) => classify(states[wf]) === "running");
     const missing = required.filter((wf) => classify(states[wf]) === "missing");
@@ -425,6 +427,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(`::error::${err.message}`);
-  process.exit(1);
+  if (!(err instanceof ReleaseGateExit)) console.error(`::error::${err.message}`);
+  process.exitCode = 1;
 });
