@@ -174,8 +174,11 @@ test("installViaTarball: refuses a pnpm-store install dir and leaves it untouche
 
 test("installViaTarball: refuses a pi-owned install dir", { timeout: 30_000 }, async () => {
     const fx = makeFixture(path.join(".pi", "agent", "node_modules", "billion-context"));
+    const prevPiHome = process.env.PI_HOME;
+    const prevPiAgentDir = process.env.PI_CODING_AGENT_DIR;
     process.env.XDG_CACHE_HOME = fx.cacheDir;
     process.env.PI_HOME = path.join(fx.root, ".pi", "agent");
+    delete process.env.PI_CODING_AGENT_DIR;
     try {
         const { tgz, integrity } = makeTarball(fx.root, "2.0.0");
         const r = await withTarballFetch(tgz, () => installViaTarball("2.0.0", "https://registry.test/x.tgz", fx.installDir, integrity));
@@ -184,7 +187,10 @@ test("installViaTarball: refuses a pi-owned install dir", { timeout: 30_000 }, a
         assert.equal(JSON.parse(readFileSync(path.join(fx.installDir, "package.json"), "utf-8")).version, "1.2.3", "pi copy untouched");
     } finally {
         delete process.env.XDG_CACHE_HOME;
-        delete process.env.PI_HOME;
+        if (prevPiHome === undefined) delete process.env.PI_HOME;
+        else process.env.PI_HOME = prevPiHome;
+        if (prevPiAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = prevPiAgentDir;
         fx.cleanup();
     }
 });
