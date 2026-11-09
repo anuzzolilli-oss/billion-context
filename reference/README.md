@@ -16,3 +16,4 @@ information.
 | [ref-keyed-surfaces.md](ref-keyed-surfaces.md) | Ref-keyed surfaces — every surface keyed by a kernel ref number (mNNNNN/bNNNNN): the #5861 ledger. Read before adding any ref-keyed lookup/endpoint |
 | [external-summary.md](external-summary.md) | External summary (compact overview for external agents) |
 | [request-body-budget.md](request-body-budget.md) | Request-body budget & overflow policy (5 GiB default, per-client overrides, overflow diagnostics) |
+| [cindy-project.md](cindy-project.md) / [中文](cindy-project.zh-CN.md) | Cindy fork setup, project instructions, complete local test recipe and live-proxy operating workflow |

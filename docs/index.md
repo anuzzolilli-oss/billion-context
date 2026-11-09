@@ -7,6 +7,8 @@
 
 | Doc | What it is |
 |---|---|
+| [Cindy project](cindy-project.md) / [中文](cindy-project.zh-CN.md) | Andrew's fork, Cindy workspace, live-runtime boundary and project instructions |
+| [Cindy workflow](../reference/cindy-project.md) / [中文](../reference/cindy-project.zh-CN.md) | Local setup, full Windows test partitions, verification and deployment/rollback procedure |
 | [README](../README.md) / [中文](../README.zh-CN.md) | Project entry: what it is, quickstart, architecture overview |
 | [architecture](architecture.md) / [中文](architecture.zh-CN.md) | **System architecture hub** (LIVE doc, owner ruling 2026-11-08): overall diagram + per-module pages, each with its own diagram — see `docs/architecture/` |
 | [configuration](configuration.md) / [中文](configuration.zh-CN.md) | Full configuration reference (generated from `website/config-reference/*.yaml` by `tools/gen-config-docs.mjs`; hand-written sections are drift-guarded) |

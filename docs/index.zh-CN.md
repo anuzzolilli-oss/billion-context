@@ -7,6 +7,8 @@
 
 | 文档 | 说明 |
 |---|---|
+| [Cindy 项目](cindy-project.zh-CN.md) / [English](cindy-project.md) | Andrew 分支仓库、Cindy 工作目录、运行边界和项目指令 |
+| [Cindy 工作流程](../reference/cindy-project.zh-CN.md) / [English](../reference/cindy-project.md) | 本地初始化、Windows 全量分片测试、验证及部署/回滚步骤 |
 | [README](../README.md) / [English](../README.zh-CN.md) | 项目入口：是什么、快速上手、架构总览 |
 | [architecture](architecture.zh-CN.md) / [English](architecture.md) | **系统架构总览**（实时维护，owner 裁定 2026-11-08）：整体架构图 + 每模块一页（各配图），见 `docs/architecture/` |
 | [configuration](configuration.zh-CN.md) / [English](configuration.md) | 全量配置参考（由 `website/config-reference/*.yaml` 经 `tools/gen-config-docs.mjs` 生成；手写部分有漂移守卫） |
