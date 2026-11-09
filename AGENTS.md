@@ -1,5 +1,7 @@
 # billion-context Development Specification
 
+> **Cindy fork context:** This checkout belongs to `anuzzolilli-oss/billion-context`; pushes and PRs target that fork. Keep `upstream` fetch-only with its push URL disabled. Read the [Cindy project guide](docs/cindy-project.md) and [local workflow](reference/cindy-project.md) for project-specific instructions.
+
 > **This document is the highest-priority specification. All developers (including AI Agents) MUST comply.**
 >
 > **How to read this:** the rules and invariants below are loaded every session and are the operative contract. Long procedures, file listings, and test/release/git mechanics live in [`reference/`](reference/) and are **not** auto-loaded — follow the inline `→ reference/…` pointers when you hit that task; don't guess at a procedure, open the file. The Key Design Decisions (KDD) below carry each entry's **operative consequence**; the full mechanism text (Tier B entries) lives verbatim in [reference/design-decisions.md](reference/design-decisions.md) — KDD numbering is stable and public, the ledger there is append-only.
