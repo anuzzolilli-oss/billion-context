@@ -31,6 +31,12 @@ import type { NativeInterceptState } from "../src/agent/native-intercept.ts";
 import type { V2HttpRequestEvent, V2PluginContext, V2State } from "../src/agent/opencode-v2.ts";
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../src/compress-tool.ts";
 
+const previousNativeHost = process.env.BILLION_CONTEXT_NATIVE;
+delete process.env.BILLION_CONTEXT_NATIVE;
+after(() => {
+    if (previousNativeHost === undefined) delete process.env.BILLION_CONTEXT_NATIVE;
+    else process.env.BILLION_CONTEXT_NATIVE = previousNativeHost;
+});
 const { shouldBootstrapNativeOpencode, createNativeRoute, planNativeOpencode, armNativeOpencode, verifyAttachAndRecover, wireBodyMediaBytes, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest, _noteRoutedForTest } = await import("../src/agent/opencode-native.ts");
 const { createOpencodeV2Setup } = await import("../src/agent/opencode-v2.ts");
 const { markNativeHost, nativeAttachOrigin } = await import("../src/agent/native-bootstrap.ts");
