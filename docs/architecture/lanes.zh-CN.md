@@ -25,9 +25,13 @@
 
 **处理车道。** 三条快车道见 [fastpaths 模块](./fastpaths.zh-CN.md)；legacy 全量重发是所有形状的默认、也是所有快车道的兜底安全网。
 
+## MCP 子进程关闭
+
+共享 stdio 服务（`src/mcp.ts`）负责请求接收和排空。stdin EOF 后停止接收新请求，并停止调用方后续 watchdog tick；已接收的调用及其后台会话注册按既有超时和重试限制完成。调用方清理等待正在运行的 watchdog tick 结束后才改路由；原生 Zcode 对其拥有的路由只交接一次。随后子进程自然退出，让异步运行时完成清理，而非在 EOF 时强制调用 `process.exit()`。信号处理保留既有退出码行为。此生命周期独立于模型 wire 的压缩模式，也不取消已经提交给代理的压缩。
+
 ## 关键入口
 
-`src/agent/plugin.ts`（x-bili-plugin 车道） · `src/agent/dsh-*` · `src/agent/pi*.ts` · `src/agent/opencode*.ts` · `src/agent/native-intercept.ts` · `src/server/lane-decisions.ts` · `src/launcher.ts`（`bili <client>` 姿态） · `tests/lane-decisions-matrix.test.ts`
+`src/agent/plugin.ts`（x-bili-plugin 车道） · `src/agent/dsh-*` · `src/agent/pi*.ts` · `src/agent/opencode*.ts` · `src/agent/native-intercept.ts` · `src/server/lane-decisions.ts` · `src/launcher.ts`（`bili <client>` 姿态） · `src/mcp.ts`（stdio 排空） · `src/claude-mcp-entry.ts` / `src/kimi/native-mcp.ts` / `src/zcode/mcp-entry.ts`（调用方清理） · `tests/lane-decisions-matrix.test.ts`
 
 ## 相关
 

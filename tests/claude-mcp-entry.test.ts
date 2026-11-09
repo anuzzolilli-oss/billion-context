@@ -205,16 +205,44 @@ test("watchdogTick: a failed bring-up keeps the counter hot — immediate retry 
     assert.equal(f.state.failures, 0);
 });
 
+for (const rejects of [false, true]) {
+    test(`Claude EOF hook waits for an active tick and prevents future ticks (rejects=${rejects})`, async () => {
+        let release!: () => void;
+        let entered!: () => void;
+        const blocked = new Promise<void>((resolve) => { release = resolve; });
+        const started = new Promise<void>((resolve) => { entered = resolve; });
+        let calls = 0;
+        let hooks: Parameters<NonNullable<NonNullable<Parameters<typeof main>[0]>["runStdio"]>>[0];
+        await withEnv({ NODE_TEST_CONTEXT: undefined, BILLION_CONTEXT_PROXY: undefined, BILI_PROVIDER_REWRITES: undefined, BILI_DISABLED: undefined, BILLION_CONTEXT_NATIVE: undefined, BILI_PROXY_PORT: undefined }, async () => {
+            await main({ intervalMs: 1, probe: async () => { calls++; entered(); await blocked; if (rejects) throw new Error("blocked probe failed"); return true; }, runStdio: (opts) => { hooks = opts; } });
+            const deadline = setTimeout(() => entered(), 1000);
+            try {
+                assert.ok(hooks?.onEnd);
+                await started;
+                assert.equal(calls, 1);
+                let stopped = false;
+                const drain = Promise.resolve(hooks.onEnd()).then(() => { stopped = true; });
+                await new Promise((resolve) => setTimeout(resolve, 15));
+                assert.equal(stopped, false);
+                release();
+                await drain;
+                await new Promise((resolve) => setTimeout(resolve, 15));
+                assert.equal(calls, 1);
+            } finally { clearTimeout(deadline); release(); await hooks?.onEnd?.(); await hooks?.onDrained?.(); }
+        });
+    });
+}
+
 test("startWatchdog: fires on repeated death and survives via unref'd timer", async () => {
     const f = tickFixture();
     const state: MutableWatchdogState = { origin: ORIGIN, failures: 0 };
-    const timer = startWatchdog(state, { port: ZONE_PORT_BASE, strict: false }, (m) => f.logs.push(m), { ...f.deps, intervalMs: 5 });
+    const stop = startWatchdog(state, { port: ZONE_PORT_BASE, strict: false }, (m) => f.logs.push(m), { ...f.deps, intervalMs: 5 });
     try {
         const deadline = Date.now() + 5000;
         while (f.ensureCalls.length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
         assert.ok(f.ensureCalls.length >= 1, "watchdog brought the proxy back");
     } finally {
-        clearInterval(timer);
+        await stop();
     }
 });
 

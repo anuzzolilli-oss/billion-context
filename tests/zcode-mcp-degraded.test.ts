@@ -10,7 +10,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { detectCurrentZcodeOrigin, zcodeStoreCandidates } from "../src/zcode/json-edit.ts";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import http from "node:http";
@@ -25,11 +26,14 @@ interface Harness {
     lines: string[];
     send(msg: unknown): void;
     exit: Promise<number | null>;
+    stderr(): string;
 }
 
 function sandboxEnv(sandbox: string, extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = { ...process.env };
     for (const key of [
+        "BILLION_CONTEXT_NATIVE",
+        "PI_CODING_AGENT_DIR",
         "BILLION_CONTEXT_PROXY",
         "BILLION_CONTEXT_ATTACH",
         "BILLION_CONTEXT_PLUGIN",
@@ -49,15 +53,23 @@ function sandboxEnv(sandbox: string, extra: Record<string, string> = {}): NodeJS
     return { ...env, ...extra };
 }
 
-function spawnEntry(env: NodeJS.ProcessEnv): Harness {
-    const child = spawn(process.execPath, ["--import", "tsx", ENTRY], { env, stdio: ["pipe", "pipe", "pipe"] });
+function spawnEntry(env: NodeJS.ProcessEnv, built = false): Harness {
+    const child = spawn(process.execPath, built ? [path.join(ROOT, "dist", "zcode", "mcp-entry.js")] : ["--import", "tsx", ENTRY], { env, stdio: ["pipe", "pipe", "pipe"] });
     const lines: string[] = [];
+    let buffer = "";
+    let stderr = "";
     child.stdout!.on("data", (d: Buffer) => {
-        for (const l of d.toString().split("\n")) if (l.trim()) lines.push(l.trim());
+        buffer += d.toString();
+        const complete = buffer.split("\n");
+        buffer = complete.pop()!;
+        for (const line of complete) if (line.trim()) lines.push(line.trim());
     });
-    child.stderr!.on("data", () => {});
-    const exit = new Promise<number | null>((resolve) => child.on("exit", (code) => resolve(code)));
-    return { child, lines, send: (msg) => child.stdin!.write(JSON.stringify(msg) + "\n"), exit };
+    child.stderr!.on("data", (d: Buffer) => { stderr += d.toString(); });
+    const exit = new Promise<number | null>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("close", (code) => resolve(code));
+    });
+    return { child, lines, send: (msg) => child.stdin!.write(JSON.stringify(msg) + "\n"), exit, stderr: () => stderr };
 }
 
 function byId(lines: string[], n: number): Record<string, unknown> {
@@ -112,7 +124,8 @@ test("mcp-entry serves an idle handshake instead of dying pre-initialize (#1892 
             // master was exit(0) BEFORE initialize answered.
             assert.equal(h.child.exitCode, null);
             h.child.stdin!.end();
-            assert.equal(await h.exit, 0);
+            assert.equal(await h.exit, 0, h.stderr());
+            assert.doesNotMatch(h.stderr(), /Assertion failed|UV_HANDLE_CLOSING|UnhandledPromiseRejection/);
         } finally {
             if (h.child.exitCode === null) h.child.kill();
         }
@@ -156,7 +169,8 @@ test("mcp-entry degraded with a healthy proxy still serves the real ACP tools (#
             const list = byId(h.lines, 2) as { result?: { tools?: { name?: string }[] } };
             assert.equal(list.result?.tools?.[0]?.name, "compress");
             h.child.stdin!.end();
-            assert.equal(await h.exit, 0);
+            assert.equal(await h.exit, 0, h.stderr());
+            assert.doesNotMatch(h.stderr(), /Assertion failed|UV_HANDLE_CLOSING|UnhandledPromiseRejection/);
         } finally {
             if (h.child.exitCode === null) h.child.kill();
         }
@@ -165,3 +179,54 @@ test("mcp-entry degraded with a healthy proxy still serves the real ACP tools (#
         rmrf(sandbox);
     }
 });
+
+for (const built of [false, true]) {
+    for (const earlyEof of [false, true]) {
+        test(`native EOF restores durable routing (built=${built}, duringStartup=${earlyEof})`, { timeout: 30000 }, async (t) => {
+            const sandbox = mkdtempSync(path.join(tmpdir(), "zcode-native-eof-"));
+            const dataDir = path.join(sandbox, "zcode-data", ".zcode");
+            mkdirSync(path.join(dataDir, "v2"), { recursive: true });
+            const store = zcodeStoreCandidates(dataDir, "legacy", {})[0];
+            const upstream = "https://open.bigmodel.cn/api/anthropic";
+            writeFileSync(store, JSON.stringify({ provider: { "builtin:bigmodel-coding-plan": { options: { baseURL: upstream } } } }));
+            let releaseManifest: (() => void) | undefined;
+            let manifests = 0;
+            const server = http.createServer((req, res) => {
+                res.setHeader("content-type", "application/json");
+                if (req.url?.startsWith("/__bili/plugin/manifest")) {
+                    manifests++;
+                    const send = () => res.end(JSON.stringify({ tools: { anthropic: [{ name: "compress", input_schema: { type: "object" } }] } }));
+                    if (earlyEof && manifests === 1) releaseManifest = send;
+                    else send();
+                } else res.end('{"ok":true}');
+            });
+            await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+            const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+            const env = sandboxEnv(sandbox, { ZCODE_DATA_BASE_DIR: path.join(sandbox, "zcode-data"), BILLION_CONTEXT_PROXY: origin });
+            const h = spawnEntry(env, built);
+            t.after(async () => {
+                if (h.child.exitCode === null) h.child.kill();
+                await h.exit;
+                server.closeAllConnections();
+                await new Promise<void>((resolve) => server.close(() => resolve()));
+                rmrf(sandbox);
+            });
+            if (earlyEof) {
+                await waitFor(() => releaseManifest !== undefined, "startup manifest");
+                h.child.stdin!.end();
+                releaseManifest!();
+            } else {
+                h.send({ jsonrpc: "2.0", id: 1, method: "initialize" });
+                await waitFor(() => byId(h.lines, 1).id === 1, "native initialize");
+                assert.equal(detectCurrentZcodeOrigin(dataDir, env), origin);
+                assert.doesNotMatch(h.stderr(), /exit handoff:/);
+                h.child.stdin!.end();
+            }
+            assert.equal(await h.exit, 0, h.stderr());
+            assert.doesNotMatch(h.stderr(), /Assertion failed|UV_HANDLE_CLOSING|UnhandledPromiseRejection/);
+            assert.equal((h.stderr().match(/exit handoff: store reverted to direct upstream/g) ?? []).length, 1, h.stderr());
+            assert.equal(detectCurrentZcodeOrigin(dataDir, env), undefined);
+            assert.equal(JSON.parse(readFileSync(store, "utf8")).provider["builtin:bigmodel-coding-plan"].options.baseURL, upstream);
+        });
+    }
+}

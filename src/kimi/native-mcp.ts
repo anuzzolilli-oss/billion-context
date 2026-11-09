@@ -22,18 +22,24 @@ import {
 const WATCHDOG_INTERVAL_MS = 30000;
 const WATCHDOG_FAILURE_LIMIT = 3;
 
-function startWatchdog(applied: KimiRouteApplied, attached: boolean, log: (msg: string) => void): void {
+export function startWatchdog(applied: KimiRouteApplied, attached: boolean, log: (msg: string) => void, deps: {
+    intervalMs?: number;
+    probe?: typeof probeProxyHealth;
+    ensure?: typeof ensureProxyRunning;
+    route?: typeof routeKimiConfig;
+    activate?: typeof activateKimiPluginMode;
+    modelWindows?: typeof kimiConfigModelWindows;
+} = {}): () => Promise<void> {
     const state = { origin: applied.origin, applied };
     let failures = 0;
-    let busy = false;
+    let pending: Promise<void> | undefined;
     const timer = setInterval(() => {
-        if (busy) return;
-        busy = true;
-        void watchdogTick().catch((err) => log(`watchdog error: ${err instanceof Error ? err.message : String(err)}`))
-            .finally(() => { busy = false; });
+        if (pending) return;
+        pending = watchdogTick().catch((err) => log(`watchdog error: ${err instanceof Error ? err.message : String(err)}`))
+            .finally(() => { pending = undefined; });
 
         async function watchdogTick(): Promise<void> {
-            if (await probeProxyHealth(state.origin)) { failures = 0; return; }
+            if (await (deps.probe ?? probeProxyHealth)(state.origin)) { failures = 0; return; }
             failures += 1;
             if (failures < WATCHDOG_FAILURE_LIMIT) return;
             if (attached) {
@@ -43,24 +49,25 @@ function startWatchdog(applied: KimiRouteApplied, attached: boolean, log: (msg: 
             // #3436/#3557: same windows source as the plugin bootstrap path —
             // a respawn presenting a different map than the original proxy
             // recorded would refuse each other on attach and stack instances.
-            const modelWindows = kimiConfigModelWindows();
-            const handle = await ensureProxyRunning(
+            const modelWindows = (deps.modelWindows ?? kimiConfigModelWindows)();
+            const handle = await (deps.ensure ?? ensureProxyRunning)(
                 { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "kimi", ...(modelWindows ? { modelWindows } : {}) },
                 { scriptPath: nativeProxyScriptPath() },
             );
             if (handle.origin !== state.origin) {
                 process.env.BILI_MCP_PROXY = handle.origin;
-                const routed = await routeKimiConfig({ origin: handle.origin, log });
+                const routed = await (deps.route ?? routeKimiConfig)({ origin: handle.origin, log });
                 if (!routed) throw new Error("proxy respawned but the kimi config rewrite failed");
-                await activateKimiPluginMode(routed, { log });
+                await (deps.activate ?? activateKimiPluginMode)(routed, { log });
                 state.origin = handle.origin;
                 state.applied = routed;
                 log(`proxy respawned at ${handle.origin} — config re-routed`);
             }
             failures = 0;
         }
-    }, WATCHDOG_INTERVAL_MS);
+    }, deps.intervalMs ?? WATCHDOG_INTERVAL_MS);
     timer.unref?.();
+    return async () => { clearInterval(timer); await pending; };
 }
 
 export async function main(): Promise<void> {
@@ -90,8 +97,8 @@ export async function main(): Promise<void> {
         process.exit(0);
     }
     await activateKimiPluginMode(applied, { log });
-    startWatchdog(applied, bootstrap.attached, log);
-    runMcpStdio();
+    const stopWatchdog = startWatchdog(applied, bootstrap.attached, log);
+    runMcpStdio({ onEnd: stopWatchdog });
 }
 
 if (process.argv[1] && /(?:^|[\\/])native-mcp\.(?:ts|js)$/.test(process.argv[1])) {
