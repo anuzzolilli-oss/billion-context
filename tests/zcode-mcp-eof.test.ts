@@ -44,6 +44,40 @@ test("EOF stops future watchdog ticks and waits for the active tick before one h
     } finally { clearTimeout(deadline); tick.resolve(); await stop(); }
 });
 
+for (const recoveryStarted of [false, true]) {
+    test(`stop blocks new recovery but joins started recovery (started=${recoveryStarted})`, { timeout: 5000 }, async () => {
+        const blocked = deferred();
+        const entered = deferred();
+        let recoveries = 0;
+        let repairs = 0;
+        let joined = false;
+        const state = { origin: "http://127.0.0.1:1234", failures: 2, policy: defaultZcodeRoutePolicy() };
+        const stop = entry.startWatchdog(state, false, () => {}, {
+            intervalMs: 1,
+            probe: async () => {
+                if (!recoveryStarted) { entered.resolve(); await blocked.promise; }
+                return false;
+            },
+            ensure: async () => {
+                recoveries++;
+                if (recoveryStarted) { entered.resolve(); await blocked.promise; }
+                return { origin: state.origin };
+            },
+            repair: async () => { repairs++; },
+        });
+        try {
+            await entered.promise;
+            const stopped = stop().then(() => { joined = true; });
+            await delay(20);
+            assert.equal(joined, false);
+            blocked.resolve();
+            await stopped;
+            assert.equal(recoveries, recoveryStarted ? 1 : 0);
+            assert.equal(repairs, recoveryStarted ? 1 : 0);
+        } finally { blocked.resolve(); await stop(); }
+    });
+}
+
 for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]] as const) {
     test(`signal ${signal} during EOF handoff retains exit ${code}`, async () => {
         const work = deferred();

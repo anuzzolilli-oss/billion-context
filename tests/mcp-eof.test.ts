@@ -1,12 +1,33 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import fs from "node:fs";
 import http from "node:http";
 import { once } from "node:events";
-import { test } from "node:test";
+import { after, before, test } from "node:test";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
+import { rmrf } from "./tmp-rm.ts";
 
 const source = pathToFileURL(path.resolve("src/mcp.ts")).href;
+const root = path.resolve(import.meta.dirname, "..");
+
+let builtDir: string | undefined;
+before(() => { builtEntry(); }, { timeout: 300_000 });
+after(() => { if (builtDir) rmrf(builtDir); });
+
+function builtEntry(): string {
+    if (!builtDir) {
+        const tmp = path.join(root, ".tmp");
+        fs.mkdirSync(tmp, { recursive: true });
+        builtDir = fs.mkdtempSync(path.join(tmp, "mcp-eof-dist-"));
+        // Keep tsup's clean:true away from other suites' root dist builds.
+        fs.copyFileSync(path.join(root, "package.json"), path.join(builtDir, "package.json"));
+        execFileSync(process.execPath, [path.join(root, "node_modules/tsup/dist/cli-default.js"), "--out-dir", path.join(builtDir, "dist")], { cwd: root, stdio: "pipe", timeout: 300_000 });
+    }
+    const entry = path.join(builtDir, "dist", "mcp.js");
+    assert.ok(fs.existsSync(entry), `build did not produce ${entry}`);
+    return entry;
+}
 
 function child(script: string, origin?: string, extraEnv: NodeJS.ProcessEnv = {}) {
     const env: NodeJS.ProcessEnv = { ...process.env, BILI_MCP_PROXY: origin ?? "http://127.0.0.1:1" };
@@ -18,7 +39,7 @@ function child(script: string, origin?: string, extraEnv: NodeJS.ProcessEnv = {}
     proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
     proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
     const closed = once(proc, "close").then(([code, signal]) => ({ code, signal, stdout, stderr }));
-    return { proc, closed, output: () => stdout };
+    return { proc, closed, output: () => stdout, errors: () => stderr };
 }
 
 async function waitFor(check: () => boolean): Promise<void> {
@@ -30,8 +51,8 @@ async function waitFor(check: () => boolean): Promise<void> {
 }
 
 for (const built of [false, true]) {
-    test(`direct MCP entry drains ping at EOF (built=${built})`, { timeout: 15000 }, async (t) => {
-        const args = built ? ["dist/mcp.js"] : ["--import", "tsx", "src/mcp.ts"];
+    test(`direct MCP entry drains ping at EOF (built=${built})`, { timeout: 360000 }, async (t) => {
+        const args = built ? [builtEntry()] : ["--import", "tsx", "src/mcp.ts"];
         const proc = spawn(process.execPath, args, { stdio: "pipe" });
         t.after(() => { if (proc.exitCode === null) proc.kill(); });
         let stdout = "";
@@ -49,7 +70,7 @@ for (const built of [false, true]) {
 }
 
 for (const built of [false, true]) {
-    test(`accepted tools/call completes before EOF cleanup (built=${built})`, { timeout: 20000 }, async (t) => {
+    test(`accepted tools/call completes before EOF cleanup (built=${built})`, { timeout: 360000 }, async (t) => {
         let release: (() => void) | undefined;
         let forwarded = "";
         const server = http.createServer((req, res) => {
@@ -63,7 +84,7 @@ for (const built of [false, true]) {
         t.after(() => { server.closeAllConnections(); server.close(); });
         const address = server.address();
         assert.ok(address && typeof address !== "string");
-        const module = built ? pathToFileURL(path.resolve("dist/mcp.js")).href : source;
+        const module = built ? pathToFileURL(builtEntry()).href : source;
         const h = child(`
             import { runMcpStdio } from ${JSON.stringify(module)};
             runMcpStdio({ onDrained: () => process.stdout.write('cleaned\\n') });
@@ -71,6 +92,7 @@ for (const built of [false, true]) {
         t.after(() => { if (h.proc.exitCode === null) h.proc.kill(); });
         h.proc.stdin.write('{"jsonrpc":"2.0","id":0,"method":"initialize"}\n');
         await waitFor(() => h.output().includes('"id":0'));
+        assert.equal(JSON.parse(h.output().trim().split("\n")[0]).result.serverInfo.version, JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version);
         h.proc.stdin.write('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"compress","arguments":{"conversation_id":"eof-session","content":"fold"}}}\n');
         await waitFor(() => release !== undefined);
         assert.deepEqual(JSON.parse(forwarded), { conversationId: "eof-session", tool: "compress", args: { content: "fold" } });
@@ -87,6 +109,59 @@ for (const built of [false, true]) {
         assert.doesNotMatch(result.stderr, /Assertion failed|UV_HANDLE_CLOSING|UnhandledPromiseRejection/);
     });
 }
+
+test("closed stdout after EOF still drains both accepted calls before cleanup", { timeout: 20000 }, async (t) => {
+    const releases: Array<() => void> = [];
+    const server = http.createServer((req, res) => {
+        res.setHeader("content-type", "application/json");
+        if (req.url?.startsWith("/__bili/plugin/tool")) {
+            req.resume();
+            req.on("end", () => releases.push(() => res.end(JSON.stringify({ ok: true, result: "done" }))));
+        } else res.end(JSON.stringify({ tools: { anthropic: [{ name: "compress", input_schema: { type: "object" } }] } }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    t.after(() => { server.closeAllConnections(); server.close(); });
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const h = child(`
+        import { runMcpStdio } from ${JSON.stringify(source)};
+        runMcpStdio({ onEnd: () => process.stderr.write('ended\\n'), onDrained: () => process.stderr.write('cleaned\\n') });
+    `, `http://127.0.0.1:${address.port}`);
+    t.after(() => { if (h.proc.exitCode === null) h.proc.kill(); });
+    h.proc.stdin.write('{"jsonrpc":"2.0","id":0,"method":"initialize"}\n');
+    await waitFor(() => h.output().includes('"id":0'));
+    for (const id of [1, 2]) h.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "compress", arguments: { conversation_id: "eof-session", content: "fold" } } }) + "\n");
+    await waitFor(() => releases.length === 2);
+    h.proc.stdin.end();
+    h.proc.stdout.destroy();
+    await waitFor(() => h.errors().includes("ended"));
+    releases[0]();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(h.proc.exitCode, null, h.errors());
+    assert.doesNotMatch(h.errors(), /cleaned/);
+    releases[1]();
+    const result = await h.closed;
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stderr, /ended[\s\S]*cleaned/);
+});
+
+test("dispatch failures reply to initialize requests, never notifications", { timeout: 15000 }, async (t) => {
+    const h = child(`
+        import { runMcpStdio } from ${JSON.stringify(source)};
+        runMcpStdio({ onDrained: () => process.stdout.write('cleaned\\n') });
+    `);
+    t.after(() => { if (h.proc.exitCode === null) h.proc.kill(); });
+    h.proc.stdin.end([
+        { jsonrpc: "2.0", id: 7, method: "initialize", params: { _meta: { ui: { sessionId: 42 } } } },
+        { jsonrpc: "2.0", method: "initialize", params: { _meta: { ui: { sessionId: 42 } } } },
+    ].map((msg) => JSON.stringify(msg) + "\n").join(""));
+    const result = await h.closed;
+    assert.equal(result.code, 1, result.stderr);
+    const lines = result.stdout.trim().split("\n");
+    assert.equal(lines.length, 2);
+    assert.deepEqual(JSON.parse(lines[0]), { jsonrpc: "2.0", id: 7, error: { code: -32603, message: "Internal error" } });
+    assert.equal(lines[1], "cleaned");
+});
 
 test("identity registration drains on EOF without delaying initialize", { timeout: 15000 }, async (t) => {
     let release: (() => void) | undefined;
@@ -172,8 +247,12 @@ test("EOF drains an accepted request before cleanup; incomplete final frames sta
     assert.match(result.stderr, /stop failed/);
     assert.doesNotMatch(result.stderr, /UnhandledPromiseRejection/);
     const lines = result.stdout.trim().split("\n").slice(1);
-    assert.equal(lines[0], "stopped");
-    assert.equal(JSON.parse(lines[1]).id, 1);
-    assert.equal(JSON.parse(lines[1]).result.tools[0].name, "compress");
-    assert.deepEqual(lines.slice(2), ["cleaned"]);
+    assert.equal(lines.length, 4);
+    const error = lines.find((line) => line.startsWith('{"jsonrpc":"2.0","id":3'));
+    assert.ok(error);
+    assert.equal(JSON.parse(error).error.code, -32603);
+    assert.equal(lines.filter((line) => line === "stopped").length, 1);
+    assert.equal(JSON.parse(lines[2]).id, 1);
+    assert.equal(JSON.parse(lines[2]).result.tools[0].name, "compress");
+    assert.equal(lines[3], "cleaned");
 });

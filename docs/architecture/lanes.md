@@ -27,7 +27,7 @@ This module answers three questions per request: who carried it in (which host, 
 
 ## MCP child shutdown
 
-The shared stdio server (`src/mcp.ts`) owns request admission and draining. On stdin EOF it stops accepting requests and stops future caller watchdog ticks, then lets accepted calls and their background session registration finish under their existing timeout/retry limits. Caller cleanup waits for an already-running watchdog tick before changing routing; native Zcode hands off its owned route once. The child then exits naturally, allowing asynchronous runtime teardown instead of forcing `process.exit()` on EOF. Signal handling retains its existing exit-code behavior. This lifecycle is separate from model-wire compression mode and does not cancel compression already submitted to the proxy.
+The shared stdio server (`src/mcp.ts`) owns request admission and draining. On stdin EOF it stops accepting requests and stops future caller watchdog ticks, then lets accepted calls and their background session registration finish under their existing timeout/retry limits. A stopped watchdog settles work already underway without starting new recovery after a pending probe completes. Caller cleanup waits for that work before changing routing; native Zcode hands off its owned route once. A confirmed stdout disconnect does not abandon accepted work or routing cleanup. The child then exits naturally, allowing asynchronous runtime teardown instead of forcing `process.exit()` on EOF. Signal handling retains its existing exit-code behavior. This lifecycle is separate from model-wire compression mode and does not cancel compression already submitted to the proxy.
 
 ## Key entries
 

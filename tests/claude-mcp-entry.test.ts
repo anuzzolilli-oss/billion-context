@@ -4,7 +4,8 @@
 // installer's MCP face migration (legacy dist/mcp.js swap, current skip,
 // foreign registration untouched).
 
-import { test } from "node:test";
+import { afterEach, beforeEach, test } from "node:test";
+import { closeLogger } from "../src/logger.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -20,6 +21,14 @@ import { rmrf } from "./tmp-rm.ts";
 
 const ORIGIN = `http://127.0.0.1:${ZONE_PORT_BASE}`;
 const DRIFTED = `http://127.0.0.1:${ZONE_PORT_BASE + 1}`;
+
+let savedEnv: NodeJS.ProcessEnv;
+beforeEach(() => { savedEnv = { ...process.env }; });
+afterEach(() => {
+    closeLogger();
+    for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
+    Object.assign(process.env, savedEnv);
+});
 
 function sandbox(): { dir: string; settings: string; mcpJson: string } {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-mcp-"));
@@ -205,15 +214,63 @@ test("watchdogTick: a failed bring-up keeps the counter hot — immediate retry 
     assert.equal(f.state.failures, 0);
 });
 
+test("startWatchdog stop blocks recovery from an outstanding failed probe", { timeout: 5000 }, async () => {
+    let release!: (healthy: boolean) => void;
+    let entered!: () => void;
+    const probing = new Promise<void>((resolve) => { entered = resolve; });
+    let recoveries = 0;
+    const stop = startWatchdog({ origin: ORIGIN, failures: 2 }, { port: 0, strict: false }, () => {}, {
+        intervalMs: 5,
+        probe: () => { entered(); return new Promise<boolean>((resolve) => { release = resolve; }); },
+        ensure: async () => { recoveries += 1; return { origin: ORIGIN, port: 0 }; },
+    });
+    try {
+        await probing;
+        const stopped = stop();
+        release(false);
+        await stopped;
+        assert.equal(recoveries, 0);
+    } finally { release?.(false); await stop(); }
+});
+
+test("startWatchdog stop joins recovery already underway", { timeout: 5000 }, async () => {
+    let release!: () => void;
+    let entered!: () => void;
+    const recovering = new Promise<void>((resolve) => { entered = resolve; });
+    const state = { origin: ORIGIN, failures: 2 };
+    let joined = false;
+    const stop = startWatchdog(state, { port: 0, strict: false }, () => {}, {
+        intervalMs: 5,
+        probe: async () => false,
+        ensure: async () => {
+            entered();
+            await new Promise<void>((resolve) => { release = resolve; });
+            return { origin: DRIFTED, port: 0 };
+        },
+        repin: () => [],
+    });
+    try {
+        await recovering;
+        const stopped = stop().then(() => { joined = true; });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        assert.equal(joined, false);
+        release();
+        await stopped;
+        assert.equal(state.origin, DRIFTED);
+    } finally { release?.(); await stop(); }
+});
+
 for (const rejects of [false, true]) {
-    test(`Claude EOF hook waits for an active tick and prevents future ticks (rejects=${rejects})`, async () => {
+    test(`Claude EOF hook waits for an active tick and prevents future ticks (rejects=${rejects})`, async (t) => {
+        const box = sandbox();
+        t.after(() => { closeLogger(); rmrf(box.dir); });
         let release!: () => void;
         let entered!: () => void;
         const blocked = new Promise<void>((resolve) => { release = resolve; });
         const started = new Promise<void>((resolve) => { entered = resolve; });
         let calls = 0;
         let hooks: Parameters<NonNullable<NonNullable<Parameters<typeof main>[0]>["runStdio"]>>[0];
-        await withEnv({ NODE_TEST_CONTEXT: undefined, BILLION_CONTEXT_PROXY: undefined, BILI_PROVIDER_REWRITES: undefined, BILI_DISABLED: undefined, BILLION_CONTEXT_NATIVE: undefined, BILI_PROXY_PORT: undefined }, async () => {
+        await withEnv({ NODE_TEST_CONTEXT: undefined, BILLION_CONTEXT_PROXY: undefined, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_CLAUDE: undefined, BILLION_CONTEXT_PLUGIN: undefined, BILI_PROXY_PORT: undefined }, async () => {
             await main({ intervalMs: 1, probe: async () => { calls++; entered(); await blocked; if (rejects) throw new Error("blocked probe failed"); return true; }, runStdio: (opts) => { hooks = opts; } });
             const deadline = setTimeout(() => entered(), 1000);
             try {

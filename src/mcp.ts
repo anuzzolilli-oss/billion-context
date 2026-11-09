@@ -107,8 +107,9 @@ let conversationId = CONVERSATION_FROM_ENV;
 // binding plus any per-call ids seen so far (issue-once each).
 const registeredConversations = new Set<string>();
 let initialized = false;
+let outputDisconnected = false;
 function send(msg: unknown): void {
-    process.stdout.write(JSON.stringify(msg) + "\n");
+    if (!outputDisconnected) process.stdout.write(JSON.stringify(msg) + "\n");
 }
 
 function sendResult(id: JsonRpcId, result: unknown): void {
@@ -446,6 +447,10 @@ async function handleMessage(msg: {
     }
 }
 function mcpMain(opts: McpStdioOptions = {}): void {
+    process.stdout.on("error", (err: NodeJS.ErrnoException) => {
+        if (err.code !== "EPIPE" && err.code !== "ECONNRESET" && err.code !== "ERR_STREAM_DESTROYED") throw err;
+        outputDisconnected = true;
+    });
     let buf = "";
     let ended = false;
     const pending = new Set<Promise<void>>();
@@ -453,8 +458,11 @@ function mcpMain(opts: McpStdioOptions = {}): void {
         loggerLog("error", `[bili-mcp] shutdown/request failed: ${err instanceof Error ? err.message : String(err)}`);
         process.exitCode = 1;
     };
-    const track = (work: Promise<void>) => {
-        const settled = work.catch(reportFailure);
+    const track = (work: Promise<void>, requestId?: JsonRpcId) => {
+        const settled = work.catch((err: unknown) => {
+            reportFailure(err);
+            if (requestId !== undefined) sendError(requestId, -32603, "Internal error");
+        });
         pending.add(settled);
         void settled.then(() => pending.delete(settled));
     };
@@ -474,7 +482,9 @@ function mcpMain(opts: McpStdioOptions = {}): void {
                 continue;
             }
             if (parsed && typeof parsed === "object") {
-                track(handleMessage(parsed as Parameters<typeof handleMessage>[0], track));
+                const msg = parsed as Parameters<typeof handleMessage>[0];
+                const id = typeof msg.id === "string" || typeof msg.id === "number" || msg.id === null ? msg.id : undefined;
+                track(handleMessage(msg, track), id);
             }
         }
     });

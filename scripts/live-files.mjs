@@ -117,6 +117,7 @@ export const LIVE_FILES = [
     // network I/O and binds no port, so no zone band is needed — the entry is for
     // the tripwire alone, like #3890/#5114
     "tests/cache-keepalive.test.ts",
+    "tests/mcp-eof.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

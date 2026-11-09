@@ -32,16 +32,17 @@ export function startWatchdog(applied: KimiRouteApplied, attached: boolean, log:
 } = {}): () => Promise<void> {
     const state = { origin: applied.origin, applied };
     let failures = 0;
+    let stopped = false;
     let pending: Promise<void> | undefined;
     const timer = setInterval(() => {
-        if (pending) return;
+        if (stopped || pending) return;
         pending = watchdogTick().catch((err) => log(`watchdog error: ${err instanceof Error ? err.message : String(err)}`))
             .finally(() => { pending = undefined; });
 
         async function watchdogTick(): Promise<void> {
             if (await (deps.probe ?? probeProxyHealth)(state.origin)) { failures = 0; return; }
             failures += 1;
-            if (failures < WATCHDOG_FAILURE_LIMIT) return;
+            if (stopped || failures < WATCHDOG_FAILURE_LIMIT) return;
             if (attached) {
                 log(`attached proxy ${state.origin} unhealthy — waiting for it to recover`);
                 return;
@@ -67,7 +68,7 @@ export function startWatchdog(applied: KimiRouteApplied, attached: boolean, log:
         }
     }, deps.intervalMs ?? WATCHDOG_INTERVAL_MS);
     timer.unref?.();
-    return async () => { clearInterval(timer); await pending; };
+    return async () => { stopped = true; clearInterval(timer); await pending; };
 }
 
 export async function main(): Promise<void> {

@@ -55,6 +55,7 @@ export interface WatchdogState {
 
 export interface MutableWatchdogState extends WatchdogState {
     failures: number;
+    stopped?: boolean;
 }
 
 /** One watchdog pass: healthy → reset; dead `failureLimit` times in a row →
@@ -66,6 +67,7 @@ export interface MutableWatchdogState extends WatchdogState {
  *  the base URL claude loaded at startup, the same #1660 constraint as the
  *  hook) and follows it in our own BILI_MCP_PROXY pin so bili tools keep working. */
 export async function watchdogTick(state: MutableWatchdogState, plan: { port: number; strict: boolean }, deps: WatchdogDeps, log: (msg: string) => void): Promise<void> {
+    if (state.stopped) return;
     const probeFn = deps.probe ?? probeProxyHealth;
     const limit = deps.failureLimit ?? WATCHDOG_FAILURE_LIMIT;
     if (await probeFn(state.origin)) {
@@ -73,7 +75,7 @@ export async function watchdogTick(state: MutableWatchdogState, plan: { port: nu
         return;
     }
     state.failures += 1;
-    if (state.failures < limit) return;
+    if (state.stopped || state.failures < limit) return;
     const ensure = deps.ensure ?? ensureProxyRunning;
     const handle = await ensure(
         {
@@ -111,13 +113,13 @@ export async function watchdogTick(state: MutableWatchdogState, plan: { port: nu
 export function startWatchdog(state: MutableWatchdogState, plan: { port: number; strict: boolean }, log: (msg: string) => void, deps: WatchdogDeps = {}): () => Promise<void> {
     let pending: Promise<void> | undefined;
     const timer = setInterval(() => {
-        if (pending) return;
+        if (state.stopped || pending) return;
         pending = watchdogTick(state, plan, deps, log)
             .catch((err) => log(`watchdog error: ${err instanceof Error ? err.message : String(err)}`))
             .finally(() => { pending = undefined; });
     }, deps.intervalMs ?? WATCHDOG_INTERVAL_MS);
     timer.unref?.();
-    return async () => { clearInterval(timer); await pending; };
+    return async () => { state.stopped = true; clearInterval(timer); await pending; };
 }
 
 export async function main(opts: WatchdogDeps & { runStdio?: typeof runMcpStdio } = {}): Promise<void> {

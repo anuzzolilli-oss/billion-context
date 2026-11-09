@@ -2,6 +2,29 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { startWatchdog } from "../src/kimi/native-mcp.ts";
 
+test("Kimi stop blocks recovery from a pending failed probe", { timeout: 5000 }, async () => {
+    let release!: () => void;
+    let entered!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let recoveries = 0;
+    let probes = 0;
+    const applied = { origin: "http://127.0.0.1:1234", port: 1234, upstream: "https://example.com", modelId: "test", authSource: "test" };
+    const stop = startWatchdog(applied, false, () => {}, {
+        intervalMs: 1,
+        probe: async () => { if (++probes === 3) { entered(); await blocked; } return false; },
+        modelWindows: () => undefined,
+        ensure: async () => { recoveries++; return { origin: applied.origin, port: 1234, pid: 1, attached: false, stop: async () => {} }; },
+    });
+    try {
+        await started;
+        const stopped = stop();
+        release();
+        await stopped;
+        assert.equal(recoveries, 0);
+    } finally { release(); await stop(); }
+});
+
 for (const rejects of [false, true]) {
     test(`Kimi EOF waits for respawn activation and stops future ticks (rejects=${rejects})`, async () => {
         let release!: () => void;

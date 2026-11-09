@@ -51,6 +51,7 @@ export interface ZcodeWatchdogState {
 export interface MutableZcodeWatchdogState extends ZcodeWatchdogState {
     origin: string;
     failures: number;
+    stopped?: boolean;
 }
 
 function buildEnsureOpts(): Parameters<typeof ensureProxyRunning>[0] {
@@ -78,6 +79,7 @@ async function defaultEnsure(opts: Parameters<typeof ensureProxyRunning>[0]): Pr
  *  ensure (transient spawn/EADDRINUSE) leaves it hot so the next tick retries
  *  immediately rather than re-accumulating to the limit (~90s). */
 export async function zcodeWatchdogTick(state: MutableZcodeWatchdogState, externallyOwned: boolean, deps: ZcodeWatchdogDeps, log: (msg: string) => void): Promise<void> {
+    if (state.stopped) return;
     const probe = deps.probe ?? probeProxyHealth;
     const repair = deps.repair ?? ((selfOrigin: string) => repairSharedStoreDrift({ selfOrigin, log }));
     if (await probe(state.origin)) {
@@ -85,6 +87,7 @@ export async function zcodeWatchdogTick(state: MutableZcodeWatchdogState, extern
     } else if (state.failures + 1 < (deps.failureLimit ?? WATCHDOG_FAILURE_LIMIT)) {
         state.failures += 1;
     } else {
+        if (state.stopped) return;
         if (externallyOwned) {
             log(`attached proxy ${state.origin} unhealthy — user-owned attach posture, waiting for it to recover`);
             state.failures = 0;
@@ -117,13 +120,13 @@ export function startWatchdog(
 ): () => Promise<void> {
     let pending: Promise<void> | undefined;
     const timer = setInterval(() => {
-        if (pending) return;
+        if (state.stopped || pending) return;
         pending = zcodeWatchdogTick(state, externallyOwned, deps, log)
             .catch((err) => log(`watchdog error: ${err instanceof Error ? err.message : String(err)}`))
             .finally(() => { pending = undefined; });
     }, deps.intervalMs ?? WATCHDOG_INTERVAL_MS);
     timer.unref?.();
-    return async () => { clearInterval(timer); await pending; };
+    return async () => { state.stopped = true; clearInterval(timer); await pending; };
 }
 
 export function installExitHandoff(state: { origin: string }, log: (msg: string) => void, deps: {

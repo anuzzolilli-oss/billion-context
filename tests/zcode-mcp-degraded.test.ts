@@ -7,10 +7,10 @@
 // boxes). Real-process e2e against the tsx source, sandboxed XDG + zcode
 // data dir so the child can never touch the developer's real stores.
 
-import test from "node:test";
+import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
-import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { detectCurrentZcodeOrigin, zcodeStoreCandidates } from "../src/zcode/json-edit.ts";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -20,6 +20,23 @@ import { rmrf } from "./tmp-rm.ts";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const ENTRY = path.join(ROOT, "src", "zcode", "mcp-entry.ts");
+
+let builtDir: string | undefined;
+before(() => { builtEntry(); }, { timeout: 300_000 });
+after(() => { if (builtDir) rmrf(builtDir); });
+
+function builtEntry(): string {
+    if (!builtDir) {
+        const tmp = path.join(ROOT, ".tmp");
+        mkdirSync(tmp, { recursive: true });
+        builtDir = mkdtempSync(path.join(tmp, "zcode-mcp-degraded-dist-"));
+        copyFileSync(path.join(ROOT, "package.json"), path.join(builtDir, "package.json"));
+        execFileSync(process.execPath, [path.join(ROOT, "node_modules/tsup/dist/cli-default.js"), "--out-dir", path.join(builtDir, "dist")], { cwd: ROOT, stdio: "pipe", timeout: 300_000 });
+    }
+    const entry = path.join(builtDir, "dist", "zcode", "mcp-entry.js");
+    assert.ok(existsSync(entry), `build did not produce ${entry}`);
+    return entry;
+}
 
 interface Harness {
     child: ChildProcess;
@@ -54,7 +71,7 @@ function sandboxEnv(sandbox: string, extra: Record<string, string> = {}): NodeJS
 }
 
 function spawnEntry(env: NodeJS.ProcessEnv, built = false): Harness {
-    const child = spawn(process.execPath, built ? [path.join(ROOT, "dist", "zcode", "mcp-entry.js")] : ["--import", "tsx", ENTRY], { env, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(process.execPath, built ? [builtEntry()] : ["--import", "tsx", ENTRY], { env, stdio: ["pipe", "pipe", "pipe"] });
     const lines: string[] = [];
     let buffer = "";
     let stderr = "";
