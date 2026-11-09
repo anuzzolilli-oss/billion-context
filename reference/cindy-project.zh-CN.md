@@ -24,9 +24,10 @@ npm run build
 常规开发使用隔离数据目录的定向测试：
 
 ```powershell
+npm run build
+if ($LASTEXITCODE -ne 0) { throw 'Build failed; do not test stale component output' }
 node --import ./tests/preload-storage-baseline.mjs --import ./tests/preload-test-env.mjs --import tsx --test tests/native-fold-invariant.test.ts tests/snapshot-media-invariant.test.ts
 npm run typecheck
-npm run build
 npm run check:unused-exports
 node tools/check-architecture-docs.mjs
 git diff --check
