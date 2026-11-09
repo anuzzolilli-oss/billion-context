@@ -36,7 +36,10 @@ test("pluginUpdate: global check runs once when injected", async () => {
 
 test("pluginUpdate: pi lane reports its owner by entry form", async () => {
     const { home, cleanup } = scratchHome();
+    const prevPiHome = process.env.PI_HOME;
+    const prevPiAgentDir = process.env.PI_CODING_AGENT_DIR;
     process.env.PI_HOME = path.join(home, "agent");
+    delete process.env.PI_CODING_AGENT_DIR;
     try {
         // no settings file → not installed
         let lines = await pluginUpdate(["pi"], OPTS);
@@ -51,7 +54,10 @@ test("pluginUpdate: pi lane reports its owner by entry form", async () => {
         assert.match(lines[0], /pi update/);
         assert.match(lines[0], /#991/);
     } finally {
-        delete process.env.PI_HOME;
+        if (prevPiHome === undefined) delete process.env.PI_HOME;
+        else process.env.PI_HOME = prevPiHome;
+        if (prevPiAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = prevPiAgentDir;
         cleanup();
     }
 });
