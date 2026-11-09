@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -6,7 +6,6 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import factory, { ompTrafficRidesBili, shouldBootstrapNativeOmp, planNativeOmp, armNativeOmp, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest, _noteRoutedForTest } from "../src/agent/omp-native.ts";
 import { applyOmpFirstEventTimeout, nativeProxyScriptPath, ompFirstEventTimeoutValue, OMP_FIRST_EVENT_TIMEOUT_DEFAULT_MS, OMP_FIRST_EVENT_TIMEOUT_ENV } from "../src/agent/native-bootstrap.ts";
 import { pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot, ompPluginLoadedFrom } from "../src/plugin-install.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -21,6 +20,14 @@ process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "30";
 // real proxy instead of the mock it set up.
 delete process.env.BILLION_CONTEXT_ATTACH;
 delete process.env.BILLION_CONTEXT_PROXY;
+
+const previousNativeHost = process.env.BILLION_CONTEXT_NATIVE;
+delete process.env.BILLION_CONTEXT_NATIVE;
+after(() => {
+    if (previousNativeHost === undefined) delete process.env.BILLION_CONTEXT_NATIVE;
+    else process.env.BILLION_CONTEXT_NATIVE = previousNativeHost;
+});
+const { default: factory, ompTrafficRidesBili, shouldBootstrapNativeOmp, planNativeOmp, armNativeOmp, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest, _noteRoutedForTest } = await import("../src/agent/omp-native.ts");
 
 // #957 coexistence: markNativeHost must be set synchronously during module
 // evaluation so any in-process bili extension backs off in THIS process.
