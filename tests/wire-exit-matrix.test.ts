@@ -28,40 +28,9 @@ import { EXIT_CONCERNS, WIRE_EXITS, type ExitConcernId } from "../src/exit-matri
 
 const SLOW_MS = 1500;
 
-// Client-abort → upstream teardown propagation budget. A flat 3s (30×100ms)
-// flaked on loaded Windows runners: closed=0 after the full poll while sibling
-// cells and every other shard went green (recorded under #4599 for #4982/
-// #4774/#4683, which made the same 3s→6s move on its own branch). Doubled to 6s.
-// Raised to 10s after 6s still flaked three consecutive runs on windows-latest
-// node22 shard 2 (master c78ecb4b + ci-fixes c49bf8b1/12b988ff, all closed=0,
-// same cell, sibling shards green — load latency, not a teardown regression;
-// recorded under #4599). Flaked once more at 10s (master 9dc4c945, run
-// 41686972484, 2026-11-03: openai-sse + anthropic-sse closed=0 after the full
-// poll, ~11s each; same code green on the ubuntu22/24 and windows24 shard-2
-// siblings, pass durations 23–352ms). The mandated "investigate a real
-// teardown hang" audit found none: relay.ts arms res.on("close") ->
-// clientAbort.abort() synchronously with no linger/backstop on this path, and
-// no commit since d244ffff touched destroy/abort wiring — the residual latency
-// is runner-side event-loop starvation on loaded Windows runners. Hence a
-// platform-scoped budget instead of another flat raise: win32 doubles to 20s
-// (every recorded starvation instance was windows-latest — node22+24, multiple
-// shards, #3665/#4347 era — ubuntu never showed the signature), keeping the
-// tight 10s gate everywhere else so a genuine teardown hang still fails fast.
-// Flaked once more at 20s (ci-fixes c37293b6, run 41776902208, 2026-11-04:
-// openai-sse closed=0 after the full poll, duration 20518ms; anthropic/
-// responses/json siblings 131–410ms in the same run; master main CI green
-// 40min earlier at 23a826d3 — same load-starvation draw, not a regression).
-// That closes out the flat-raise ladder: the poller and the upstream mock
-// share ONE event loop with whatever is starving the runner, so a close event
-// cannot be delivered faster than the loop itself — an absolute wall-clock
-// budget measures the runner, not the teardown. The budget is therefore
-// extended by the poll's OWN measured event-loop lag (each tick that lands
-// late adds its lateness), capped at 2×base so a genuine hang still fails: on
-// a healthy loop the gate stays byte-for-byte the flat budget (zero
-// extension); under starvation the window grows with the measured lag up to
-// 2×base (win32: 20s base ⇒ ≤40s — the same ceiling a flat 40s raise would
-// give unconditionally, applied only when lag is actually observed). Same
-// relative-invariant discipline as the #3228/#3152-C error-delivery cells.
+// Retain the existing teardown budget (#4599); the historical Windows failures
+// did not establish starvation as their cause. Readiness and close observations
+// below must be proven independently of elapsed time (fork issue #6).
 const ABORT_TEARDOWN_BUDGET_MS = process.platform === "win32" ? 20000 : 10000;
 const TEARDOWN_POLL_MS = 100;
 
@@ -124,16 +93,15 @@ function bigResponsesInput(): Array<{ type: string; role: string; content: strin
 
 type UpstreamMode = "hang-openai" | "hang-anthropic" | "hang-responses" | "hang-json" | "slow-summary-fwd-429" | "slow-summary-429";
 
-function startUpstream(mode: UpstreamMode): Promise<{ server: http.Server; port: number; socketsClosed: () => number; requests: () => number; summaryDoneMs: () => number }> {
+function startUpstream(mode: UpstreamMode): Promise<{ server: http.Server; port: number; socketsClosed: () => number; requests: () => number; summaryDoneMs: () => number; headersSent: Promise<void> }> {
+    let markHeadersSent!: () => void;
+    const headersSent = new Promise<void>((resolve) => { markHeadersSent = resolve; });
     let closed = 0;
     let requests = 0;
     let summaryDoneMs = 0;
     const server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
-        req.on("close", () => {
-            closed++;
-        });
         req.on("end", () => {
             requests++;
             const raw = Buffer.concat(chunks).toString("utf8");
@@ -177,15 +145,30 @@ function startUpstream(mode: UpstreamMode): Promise<{ server: http.Server; port:
                 res.writeHead(200, { "content-type": "text/event-stream" });
                 res.write(responsesSsePartial());
             } else {
-                // hang-json: nothing at all — headers withheld.
+                res.writeHead(200, { "content-type": "application/json" });
+                res.flushHeaders();
+                markHeadersSent();
             }
         });
     });
+    server.on("connection", (socket) => { socket.once("close", () => { closed++; }); });
     return new Promise((resolve) => {
         server.listen(0, "127.0.0.1", () => {
-            resolve({ server, port: (server.address() as { port: number }).port, socketsClosed: () => closed, requests: () => requests, summaryDoneMs: () => summaryDoneMs });
+            resolve({ server, port: (server.address() as { port: number }).port, socketsClosed: () => closed, requests: () => requests, summaryDoneMs: () => summaryDoneMs, headersSent });
         });
     });
+}
+
+function assertUpstreamOpen(up: { requests: () => number; socketsClosed: () => number }): void {
+    assert.equal(up.requests(), 1, "upstream request exists before client abort");
+    assert.equal(up.socketsClosed(), 0, "upstream socket is still open immediately before client abort");
+}
+
+async function closeFixtureServers(...servers: http.Server[]): Promise<void> {
+    await Promise.all(servers.map((server) => new Promise<void>((resolve, reject) => {
+        server.close((error) => error ? reject(error) : resolve());
+        server.closeAllConnections();
+    })));
 }
 
 function startProxy(upstreamPort: number): Promise<http.Server> {
@@ -216,29 +199,195 @@ mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
 }
 
-/** Opens a request, waits for the first body byte (or headers for JSON),
- *  then destroys the client socket — simulating a user hitting Ctrl-C. */
-function abortAfterFirstByte(url: string, headers: Record<string, string>, body: string): Promise<"header" | "first-byte"> {
+type AbortReadiness = ({ kind: "first-byte"; marker: string; onChunk?: (chunk: string) => void } | { kind: "header"; headersSent?: Promise<void> }) & { timeoutMs?: number; beforeAbort?: () => void };
+
+// JSON is buffered by the proxy, so its fixture signals flushed upstream headers.
+// SSE must contain fixture content, not merely the proxy's preflight comments.
+function abortAfterFirstByte(url: string, headers: Record<string, string>, body: string, readiness: AbortReadiness): Promise<"header" | "first-byte"> {
     return new Promise((resolve, reject) => {
-        const req = http.request(url, { method: "POST", headers }, (res) => {
-            res.once("data", () => {
-                req.destroy();
-                resolve("first-byte");
-            });
-            // hang-json never sends a body — abort on headers after a beat.
-            res.once("end", () => resolve("header"));
-        });
-        req.on("error", (e: NodeJS.ErrnoException) => {
-            if (e.code === "ECONNRESET") resolve("first-byte");
-            else reject(e);
-        });
-        setTimeout(() => {
+        let settled = false;
+        let response: http.IncomingMessage | undefined;
+        let text = "";
+        const finish = (error?: Error) => {
+            if (settled) return;
+            if (!error) {
+                try { readiness.beforeAbort?.(); } catch (e) { error = e instanceof Error ? e : new Error(String(e)); }
+            }
+            settled = true;
+            clearTimeout(timer);
+            response?.off("data", onData);
+            response?.off("end", onEnd);
+            response?.off("close", onEnd);
             req.destroy();
-            resolve("header");
-        }, 400).unref();
+            if (error) reject(error);
+            else resolve(readiness.kind);
+        };
+        const onError = (error: Error) => finish(error);
+        const onEnd = () => finish(new Error(`Response ended before abort readiness: ${readiness.kind}`));
+        const onData = (chunk: Buffer) => {
+            const fragment = chunk.toString("utf8");
+            text += fragment;
+            if (readiness.kind === "first-byte") {
+                readiness.onChunk?.(fragment);
+                if (text.includes(readiness.marker)) finish();
+            }
+        };
+        const req = http.request(url, { method: "POST", headers }, (res) => {
+            response = res;
+            res.on("error", onError);
+            res.once("close", () => res.off("error", onError));
+            res.on("data", onData);
+            res.once("end", onEnd);
+            res.once("close", onEnd);
+            if (readiness.kind === "header" && !readiness.headersSent) finish();
+        });
+        req.on("error", onError);
+        req.once("close", () => req.off("error", onError));
+        const timer = setTimeout(() => {
+            finish(new Error(`Timed out waiting for abort readiness: ${readiness.kind}`));
+        }, readiness.timeoutMs ?? ABORT_TEARDOWN_BUDGET_MS);
+        if (readiness.kind === "header") readiness.headersSent?.then(() => finish(), onError);
         req.end(body);
     });
 }
+
+for (const sendComment of [false, true]) {
+    test(`abort fixture: delayed SSE readiness ignores ${sendComment ? "preflight comments" : "elapsed 400ms"}`, { timeout: 5000 }, async () => {
+        let response: http.ServerResponse | undefined;
+        const server = http.createServer((req, res) => {
+            req.resume();
+            response = res;
+            if (sendComment) {
+                res.writeHead(200, { "content-type": "text/event-stream" });
+                res.write(": preflight hold\n\n");
+            }
+        });
+        server.listen(0, "127.0.0.1");
+        await once(server, "listening");
+        let settled = false;
+        let observed = "";
+        let markPartial!: () => void;
+        const partialObserved = new Promise<void>((resolve) => { markPartial = resolve; });
+        const outcome = abortAfterFirstByte(`http://127.0.0.1:${(server.address() as { port: number }).port}`, {}, "{}", {
+            kind: "first-byte", marker: '"content":"par"', timeoutMs: 2000,
+            onChunk: (fragment) => {
+                observed += fragment;
+                if (observed.includes('"cont')) markPartial();
+            },
+        }).finally(() => { settled = true; });
+        void outcome.catch(() => {});
+        try {
+            await new Promise((resolve) => setTimeout(resolve, 550));
+            assert.equal(settled, false, "neither elapsed time nor proxy comments prove upstream stream readiness");
+            assert.ok(response);
+            const chunk = openaiSsePartial();
+            const split = chunk.indexOf('"content"') + 5;
+            response.write(chunk.slice(0, split));
+            await Promise.race([
+                partialObserved,
+                outcome.then(() => { throw new Error("Abort completed before partial-marker observation"); }),
+            ]);
+            assert.equal(settled, false, "a partial fixture marker is not readiness");
+            response.write(chunk.slice(split));
+            assert.equal(await outcome, "first-byte");
+        } finally {
+            await closeFixtureServers(server);
+            await outcome.catch(() => {});
+        }
+    });
+}
+
+test("abort fixture: missing readiness rejects instead of reporting successful abort", { timeout: 5000 }, async () => {
+    const server = http.createServer((req) => { req.resume(); });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    try {
+        await assert.rejects(abortAfterFirstByte(`http://127.0.0.1:${(server.address() as { port: number }).port}`, {}, "{}", {
+            kind: "first-byte", marker: '"content":"par"', timeoutMs: 600,
+        }), /Timed out waiting for abort readiness: first-byte/);
+    } finally {
+        await closeFixtureServers(server);
+    }
+});
+
+for (const failure of ["ping-only", "end", "reset"] as const) {
+    test(`abort fixture: ${failure} before SSE readiness rejects`, { timeout: 5000 }, async () => {
+        const server = http.createServer((req, res) => {
+            req.resume();
+            if (failure === "reset") { req.socket.destroy(); return; }
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            res.write(": preflight hold\n\n");
+            if (failure === "end") res.end();
+        });
+        server.listen(0, "127.0.0.1");
+        await once(server, "listening");
+        try {
+            await assert.rejects(abortAfterFirstByte(`http://127.0.0.1:${(server.address() as { port: number }).port}`, {}, "{}", {
+                kind: "first-byte", marker: '"content":"par"', timeoutMs: 600,
+            }), failure === "ping-only" ? /Timed out waiting for abort readiness/ : failure === "end" ? /Response ended before abort readiness/ : /socket hang up/);
+        } finally {
+            await closeFixtureServers(server);
+        }
+    });
+}
+
+for (const sendHeaders of [false, true]) {
+    test(`abort fixture: JSON ${sendHeaders ? "waits for actual delayed headers" : "missing headers rejects"}`, { timeout: 5000 }, async () => {
+        let response: http.ServerResponse | undefined;
+        const server = http.createServer((req, res) => { req.resume(); response = res; });
+        server.listen(0, "127.0.0.1");
+        await once(server, "listening");
+        let settled = false;
+        const outcome = abortAfterFirstByte(`http://127.0.0.1:${(server.address() as { port: number }).port}`, {}, "{}", {
+            kind: "header", timeoutMs: sendHeaders ? 2000 : 600,
+        }).finally(() => { settled = true; });
+        void outcome.catch(() => {});
+        try {
+            if (sendHeaders) {
+                await new Promise((resolve) => setTimeout(resolve, 550));
+                assert.equal(settled, false, "JSON must not abort before headers");
+                assert.ok(response);
+                response.writeHead(200, { "content-type": "application/json" });
+                response.flushHeaders();
+                assert.equal(await outcome, "header");
+            } else {
+                await assert.rejects(outcome, /Timed out waiting for abort readiness: header/);
+            }
+        } finally {
+            await closeFixtureServers(server);
+            await outcome.catch(() => {});
+        }
+    });
+}
+
+test("abort fixture: request completion is not upstream socket closure", { timeout: 5000 }, async () => {
+    const up = await startUpstream("hang-openai");
+    let client: http.ClientRequest | undefined;
+    try {
+        let socketClosed: Promise<unknown> | undefined;
+        const completed = once(up.server, "request", { signal: AbortSignal.timeout(2000) }).then(async ([req]: http.IncomingMessage[]) => {
+            assert.ok(req);
+            socketClosed = once(req.socket, "close", { signal: AbortSignal.timeout(2000) });
+            void socketClosed.catch(() => {});
+            await once(req, "close", { signal: AbortSignal.timeout(2000) });
+        });
+        void completed.catch(() => {});
+        client = http.request(`http://127.0.0.1:${up.port}`, { method: "POST" });
+        client.on("error", () => {});
+        client.end("{}");
+        const [response] = await once(client, "response", { signal: AbortSignal.timeout(2000) }) as [http.IncomingMessage];
+        response.resume();
+        await completed;
+        assert.equal(up.requests(), 1);
+        assert.equal(up.socketsClosed(), 0, "completed IncomingMessage must not count as a closed upstream socket");
+        client.destroy();
+        await socketClosed;
+        assert.equal(up.socketsClosed(), 1, "actual upstream closure must be observed before server cleanup");
+    } finally {
+        client?.destroy();
+        await closeFixtureServers(up.server);
+    }
+});
 
 test("matrix meta: every concern table is exhaustive and every coveredBy test file exists", () => {
     const concernIds = Object.keys(EXIT_CONCERNS) as ExitConcernId[];
@@ -267,18 +416,15 @@ test("abort x proxy-openai-sse: client abort mid-stream destroys the upstream re
     const proxyPort = (proxy.address() as { port: number }).port;
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${up.port}/v1/chat/completions`;
-        const outcome = await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-oai" }, JSON.stringify({ model: "m-test", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hi" }] }));
-        assert.ok(outcome === "first-byte" || outcome === "header");
+        const outcome = await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-oai" }, JSON.stringify({ model: "m-test", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hi" }] }), {
+            kind: "first-byte", marker: '"content":"par"', beforeAbort: () => assertUpstreamOpen(up),
+        });
+        assert.equal(outcome, "first-byte");
         await awaitUpstreamTeardown(up.socketsClosed);
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) must be destroyed after the client abort (closed=${up.socketsClosed()})`);
         assert.equal(up.requests(), 1, "exactly one upstream request");
     } finally {
-        proxy.close();
-        proxy.closeIdleConnections?.();
-        await once(proxy, "close");
-        up.server.close();
-        up.server.closeIdleConnections?.();
-        await once(up.server, "close");
+        await closeFixtureServers(proxy, up.server);
     }
 });
 
@@ -289,16 +435,13 @@ test("abort x proxy-anthropic-sse: client abort mid-stream destroys the upstream
     const proxyPort = (proxy.address() as { port: number }).port;
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${up.port}/v1/messages`;
-        await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-ant" }, JSON.stringify({ model: "m-test", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hi" }] }));
+        await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-ant" }, JSON.stringify({ model: "m-test", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hi" }] }), {
+            kind: "first-byte", marker: '"id":"m1"', beforeAbort: () => assertUpstreamOpen(up),
+        });
         await awaitUpstreamTeardown(up.socketsClosed);
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) destroyed after client abort (closed=${up.socketsClosed()})`);
     } finally {
-        proxy.close();
-        proxy.closeIdleConnections?.();
-        await once(proxy, "close");
-        up.server.close();
-        up.server.closeIdleConnections?.();
-        await once(up.server, "close");
+        await closeFixtureServers(proxy, up.server);
     }
 });
 
@@ -309,16 +452,13 @@ test("abort x proxy-responses-sse: client abort mid-stream destroys the upstream
     const proxyPort = (proxy.address() as { port: number }).port;
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${up.port}/v1/responses`;
-        await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-resp" }, JSON.stringify({ model: "m-test", max_tokens: 1024, stream: true, instructions: "You are a test agent.", input: [{ type: "message", role: "user", content: "hi" }] }));
+        await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-resp" }, JSON.stringify({ model: "m-test", max_tokens: 1024, stream: true, instructions: "You are a test agent.", input: [{ type: "message", role: "user", content: "hi" }] }), {
+            kind: "first-byte", marker: '"id":"r1"', beforeAbort: () => assertUpstreamOpen(up),
+        });
         await awaitUpstreamTeardown(up.socketsClosed);
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) destroyed after client abort (closed=${up.socketsClosed()})`);
     } finally {
-        proxy.close();
-        proxy.closeIdleConnections?.();
-        await once(proxy, "close");
-        up.server.close();
-        up.server.closeIdleConnections?.();
-        await once(up.server, "close");
+        await closeFixtureServers(proxy, up.server);
     }
 });
 
@@ -329,16 +469,13 @@ test("abort x proxy-json: client abort while the JSON is buffering destroys the 
     const proxyPort = (proxy.address() as { port: number }).port;
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${up.port}/v1/chat/completions`;
-        await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-json" }, JSON.stringify({ model: "m-test", max_tokens: 1024, messages: [{ role: "user", content: "hi" }] }));
+        await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-json" }, JSON.stringify({ model: "m-test", max_tokens: 1024, messages: [{ role: "user", content: "hi" }] }), {
+            kind: "header", headersSent: up.headersSent, beforeAbort: () => assertUpstreamOpen(up),
+        });
         await awaitUpstreamTeardown(up.socketsClosed);
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) destroyed after client abort (closed=${up.socketsClosed()})`);
     } finally {
-        proxy.close();
-        proxy.closeIdleConnections?.();
-        await once(proxy, "close");
-        up.server.close();
-        up.server.closeIdleConnections?.();
-        await once(up.server, "close");
+        await closeFixtureServers(proxy, up.server);
     }
 });
 
