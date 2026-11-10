@@ -199,7 +199,7 @@ mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
 }
 
-type AbortReadiness = ({ kind: "first-byte"; marker: string } | { kind: "header"; headersSent?: Promise<void> }) & { timeoutMs?: number; beforeAbort?: () => void };
+type AbortReadiness = ({ kind: "first-byte"; marker: string; onChunk?: (chunk: string) => void } | { kind: "header"; headersSent?: Promise<void> }) & { timeoutMs?: number; beforeAbort?: () => void };
 
 // JSON is buffered by the proxy, so its fixture signals flushed upstream headers.
 // SSE must contain fixture content, not merely the proxy's preflight comments.
@@ -225,8 +225,12 @@ function abortAfterFirstByte(url: string, headers: Record<string, string>, body:
         const onError = (error: Error) => finish(error);
         const onEnd = () => finish(new Error(`Response ended before abort readiness: ${readiness.kind}`));
         const onData = (chunk: Buffer) => {
-            text += chunk.toString("utf8");
-            if (readiness.kind === "first-byte" && text.includes(readiness.marker)) finish();
+            const fragment = chunk.toString("utf8");
+            text += fragment;
+            if (readiness.kind === "first-byte") {
+                readiness.onChunk?.(fragment);
+                if (text.includes(readiness.marker)) finish();
+            }
         };
         const req = http.request(url, { method: "POST", headers }, (res) => {
             response = res;
@@ -261,8 +265,15 @@ for (const sendComment of [false, true]) {
         server.listen(0, "127.0.0.1");
         await once(server, "listening");
         let settled = false;
+        let observed = "";
+        let markPartial!: () => void;
+        const partialObserved = new Promise<void>((resolve) => { markPartial = resolve; });
         const outcome = abortAfterFirstByte(`http://127.0.0.1:${(server.address() as { port: number }).port}`, {}, "{}", {
             kind: "first-byte", marker: '"content":"par"', timeoutMs: 2000,
+            onChunk: (fragment) => {
+                observed += fragment;
+                if (observed.includes('"cont')) markPartial();
+            },
         }).finally(() => { settled = true; });
         void outcome.catch(() => {});
         try {
@@ -272,7 +283,10 @@ for (const sendComment of [false, true]) {
             const chunk = openaiSsePartial();
             const split = chunk.indexOf('"content"') + 5;
             response.write(chunk.slice(0, split));
-            await new Promise((resolve) => setTimeout(resolve, 20));
+            await Promise.race([
+                partialObserved,
+                outcome.then(() => { throw new Error("Abort completed before partial-marker observation"); }),
+            ]);
             assert.equal(settled, false, "a partial fixture marker is not readiness");
             response.write(chunk.slice(split));
             assert.equal(await outcome, "first-byte");
