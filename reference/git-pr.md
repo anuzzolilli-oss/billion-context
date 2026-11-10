@@ -2,7 +2,7 @@
 
 > **Not auto-loaded.** On-demand mechanics pulled out of `AGENTS.md` §4 to keep the
 > auto-loaded spec lean. The prohibitions (never force-push/merge/publish/print-PAT,
-> branch naming, version discipline) stay in [`AGENTS.md` §4](../AGENTS.md#4-git-safety-rules-mandatory);
+> branch naming, version discipline) are in [the detailed contract §4](development-contract.md#4-git-safety-rules-mandatory);
 > this file holds the exact "open a PR without `gh`" recipe and the external-contributor
 > / post-merge-supplement mechanics.
 

@@ -1,8 +1,8 @@
 # Environment Variable Discipline (#2030)
 
 > **Not auto-loaded.** On-demand reference material pulled out of `AGENTS.md`
-> to keep the auto-loaded spec lean. The operative rule stays in
-> [`AGENTS.md` §3](../AGENTS.md#environment-variable-discipline-2030);
+> to keep the auto-loaded spec lean. The operative rule is in
+> [the detailed contract §3](development-contract.md#environment-variable-discipline-2030);
 > this file holds the category table, hard rules, and rationale.
 
 Env vars are a **scarce surface**: every `BILI_*`/`ACP_*` variable is a

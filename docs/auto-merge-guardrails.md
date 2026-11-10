@@ -3,7 +3,7 @@
 > **来源**：[#801](https://github.com/ranxianglei/billion-context/issues/801)「自动合并材料收集」。
 > **方法**：拉取三个仓库（billion-context / billion-context-pi / acp-kernel）**全部 issue + PR + 评论**（共 1543 项、1072 个 PR、3645 条评论），叠加本仓 `devlog/` 31 条迭代记录、`AGENTS.md` 完整 git 演进史、commit 类型分布，交叉比对得出。
 > **目标**：让 ~90% 的 bugfix 可自动合并，同时守住大方向不偏移。
-> **定位（重要）**：规则的**权威文本在 [`AGENTS.md` §7](../AGENTS.md#7-review--auto-merge-discipline) Review & Auto-Merge Discipline**（每次会话自动加载，是唯一操作依据）。本文件只做**证据附录**——保留基线数据、逐条 issue/PR 出处、重灾区数据分析、以及内核 vs 本仓库的归属判断。**凡是规则 / Gate / Checklist 的操作文本，一律以 §7 为准，本文不复述**，避免两处漂移。范围限定：**本次仅改本仓库**，跨仓库改动暂留人工。
+> **定位（重要）**：规则的**权威文本在 [开发细则 §7](../reference/development-contract.md#7-review--auto-merge-discipline) Review & Auto-Merge Discipline**（由 `AGENTS.md` 指定按任务强制加载；合并权限仍受其人工合并边界约束）。本文件只做**证据附录**——保留基线数据、逐条 issue/PR 出处、重灾区数据分析、以及内核 vs 本仓库的归属判断。**凡是规则 / Gate / Checklist 的操作文本，一律以 §7 为准，本文不复述**，避免两处漂移。范围限定：**本次仅改本仓库**，跨仓库改动暂留人工。
 
 ---
 

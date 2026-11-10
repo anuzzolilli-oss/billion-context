@@ -10,13 +10,13 @@
 
 1. Keep the map at ≤200 lines, one H1 and roughly seven H2 sections. Preserve hard safety boundaries and Tier A KDD consequences; put scoped procedures in references.
 2. Read the relevant detailed section before changing it. Edit one authoritative location for each detailed rule; update its map pointer/consequence when needed.
-3. Check internal links and legacy fragments. Do not relocate repo-root source paths, commands or external URLs while rebasing Markdown links.
+3. Check internal links and legacy fragments. Each legacy anchor must have a visible link to its exact policy section; an empty ID alone is not a redirect. Repository backlinks should target the detailed section directly. Do not relocate repo-root source paths, commands or external URLs while rebasing Markdown links.
 4. Do not store task status, CI counts, current branches or handoffs here. Those are session evidence, not persistent project policy.
 5. Any future harness adapter must be generated/a pointer, not another hand-maintained contract. Glossaries require verified terms and must respect the docs layout.
 
 1. 常驻入口不超过 200 行，保留一个 H1、约七个 H2；硬安全边界和 Tier A KDD 后果常驻，专项流程下沉。
 2. 修改前读取相关细则；详细规则只维护一个权威位置，必要时同步入口后果和指针。
-3. 检查内部链接和旧锚点；修正文档相对链接时，不改写源码路径、命令或外部 URL。
+3. 检查内部链接和旧锚点；每个旧锚点必须附有指向对应规则章节的可见链接，空 ID 本身不会重定向。仓内反向链接应直接指向细则章节。修正文档相对链接时，不改写源码路径、命令或外部 URL。
 4. 不在这里保存任务状态、CI 计数、分支或交接信息；这些属于会话证据。
 5. 新宿主适配只能是生成文件或指针；术语表必须有已核实术语，并遵守文档布局。
 

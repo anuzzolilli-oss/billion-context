@@ -2,7 +2,7 @@
 
 > **Not auto-loaded.** On-demand mechanics pulled out of `AGENTS.md` §3 to keep
 > the auto-loaded spec lean. The operative rules (run e2e before pipeline
-> changes, never remove the gates) stay in [`AGENTS.md` §3](../AGENTS.md#3-development-standards);
+> changes, never remove the gates) are in [the detailed contract §3](development-contract.md#3-development-standards);
 > this file holds the exact commands, env vars, phases, and CI trigger list.
 
 ## Build Commands
