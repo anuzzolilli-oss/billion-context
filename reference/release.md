@@ -2,8 +2,8 @@
 
 > **Not auto-loaded.** On-demand mechanics pulled out of `AGENTS.md` §5 to keep the
 > auto-loaded spec lean. The hard rules (never manual publish, version-only-on-release-branch,
-> kernel changes are human-gated, updater changes need a no-op release first) stay in
-> [`AGENTS.md` §5](../AGENTS.md#5-release-workflow); this file holds the exact steps,
+> kernel changes are human-gated, updater changes need a no-op release first) are in
+> [the detailed contract §5](development-contract.md#5-release-workflow); this file holds the exact steps,
 > the one-click workflow internals, and the no-op validation protocol.
 
 Releases are **fully automated via CI** (`.github/workflows/release.yml`; kernel

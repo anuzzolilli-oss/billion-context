@@ -75,39 +75,38 @@ These are scoped parts of this contract. Read each matching row before implement
 
 - Detailed policy text was extracted, not rescinded. [Context maintenance notes](reference/context-maintenance.md) record authority, preservation checks and unresolved wording; do not silently turn those tensions into new policy.
 - New decision/protocol docs belong in `docs/`, procedures in `reference/`; keep en/zh parity and both indexes updated. No redundant harness adapters or speculative glossary.
-- Legacy section links below remain redirect anchors so existing documentation continues to resolve. They delegate to the matching numbered sections in [the detailed contract](reference/development-contract.md).
+- Legacy fragments below remain compatibility landing points, each with a visible link to its exact policy section. They are not automatic redirects; repository links should target the detailed contract directly.
 
-<a id="1-project-overview"></a>
-<a id="2-architecture"></a>
-<a id="3-development-standards"></a>
-<a id="4-git-safety-rules-mandatory"></a>
-<a id="5-release-workflow"></a>
-<a id="6-contributing"></a>
-<a id="7-review--auto-merge-discipline"></a>
-<a id="71-before-you-start"></a>
-<a id="72-review-discipline"></a>
-<a id="73-correctness-guardrails"></a>
-<a id="74-auto-merge-gate-this-repo-only"></a>
-<a id="75-reviewer-focus--the-重灾区-second-round-zones"></a>
-<a id="kernel-boundary-in-repo-acp-kernel-2092"></a>
-<a id="pi-subagents-boundary-in-repo-pi-lane-component-2384"></a>
-
-<a id="billion-context-development-specification"></a>
-<a id="tech-stack"></a>
-<a id="repository-info"></a>
-<a id="module-map"></a>
-<a id="key-design-decisions"></a>
-<a id="18--身份信道接线所有车道接进同一采集缝消费者永不直读客户端存储-5825-tier-b"></a>
-<a id="install-lane--update-ownership-contract-1196"></a>
-<a id="kernel-contract-message-ids-are-never-reused"></a>
-<a id="build-commands"></a>
-<a id="local-testing--install"></a>
-<a id="e2e-regression-real-client-through-bili"></a>
-<a id="gate-test-discipline--negative-assertions-3617"></a>
-<a id="configuration-surface-discipline-owner-gated"></a>
-<a id="environment-variable-discipline-2030"></a>
-<a id="code-quality"></a>
-<a id="documentation-layout-owner-ruling-2026-11-08-5920"></a>
-<a id="issue--problem-tracking-mandatory"></a>
-<a id="issue-分类与标签规则triage-必做"></a>
-<a id="version-bumps--one-version-one-commit-one-branch"></a>
+- <a id="1-project-overview"></a>[1. Project Overview](reference/development-contract.md#1-project-overview)
+- <a id="2-architecture"></a>[2. Architecture](reference/development-contract.md#2-architecture)
+- <a id="3-development-standards"></a>[3. Development Standards](reference/development-contract.md#3-development-standards)
+- <a id="4-git-safety-rules-mandatory"></a>[4. Git Safety Rules](reference/development-contract.md#4-git-safety-rules-mandatory)
+- <a id="5-release-workflow"></a>[5. Release Workflow](reference/development-contract.md#5-release-workflow)
+- <a id="6-contributing"></a>[6. Contributing](reference/development-contract.md#6-contributing)
+- <a id="7-review--auto-merge-discipline"></a>[7. Review & Auto-Merge Discipline](reference/development-contract.md#7-review--auto-merge-discipline)
+- <a id="71-before-you-start"></a>[7.1 Before You Start](reference/development-contract.md#71-before-you-start)
+- <a id="72-review-discipline"></a>[7.2 Review Discipline](reference/development-contract.md#72-review-discipline)
+- <a id="73-correctness-guardrails"></a>[7.3 Correctness Guardrails](reference/development-contract.md#73-correctness-guardrails)
+- <a id="74-auto-merge-gate-this-repo-only"></a>[7.4 Auto-Merge Gate](reference/development-contract.md#74-auto-merge-gate-this-repo-only)
+- <a id="75-reviewer-focus--the-重灾区-second-round-zones"></a>[7.5 Reviewer Focus](reference/development-contract.md#75-reviewer-focus--the-重灾区-second-round-zones)
+- <a id="kernel-boundary-in-repo-acp-kernel-2092"></a>[Kernel Boundary](reference/development-contract.md#kernel-boundary-in-repo-acp-kernel-2092)
+- <a id="pi-subagents-boundary-in-repo-pi-lane-component-2384"></a>[Pi-Subagents Boundary](reference/development-contract.md#pi-subagents-boundary-in-repo-pi-lane-component-2384)
+- <a id="billion-context-development-specification"></a>[Detailed Development Contract](reference/development-contract.md#detailed-development-contract)
+- <a id="tech-stack"></a>[Tech Stack](reference/development-contract.md#tech-stack)
+- <a id="repository-info"></a>[Repository Info](reference/development-contract.md#repository-info)
+- <a id="module-map"></a>[Module Map](reference/development-contract.md#module-map)
+- <a id="key-design-decisions"></a>[Key Design Decisions](reference/development-contract.md#key-design-decisions)
+- <a id="18--身份信道接线所有车道接进同一采集缝消费者永不直读客户端存储-5825-tier-b"></a>[KDD 18 — 身份信道接线](reference/development-contract.md#18--身份信道接线所有车道接进同一采集缝消费者永不直读客户端存储-5825-tier-b)
+- <a id="install-lane--update-ownership-contract-1196"></a>[Install-Lane & Update-Ownership Contract](reference/development-contract.md#install-lane--update-ownership-contract-1196)
+- <a id="kernel-contract-message-ids-are-never-reused"></a>[Kernel Contract: Message IDs](reference/development-contract.md#kernel-contract-message-ids-are-never-reused)
+- <a id="build-commands"></a>[Build Commands](reference/development-contract.md#build-commands)
+- <a id="local-testing--install"></a>[Local Testing & Install](reference/development-contract.md#local-testing--install)
+- <a id="e2e-regression-real-client-through-bili"></a>[E2E Regression](reference/development-contract.md#e2e-regression-real-client-through-bili)
+- <a id="gate-test-discipline--negative-assertions-3617"></a>[Gate Test Discipline](reference/development-contract.md#gate-test-discipline--negative-assertions-3617)
+- <a id="configuration-surface-discipline-owner-gated"></a>[Configuration Surface Discipline](reference/development-contract.md#configuration-surface-discipline-owner-gated)
+- <a id="environment-variable-discipline-2030"></a>[Environment Variable Discipline](reference/development-contract.md#environment-variable-discipline-2030)
+- <a id="code-quality"></a>[Code Quality](reference/development-contract.md#code-quality)
+- <a id="documentation-layout-owner-ruling-2026-11-08-5920"></a>[Documentation Layout](reference/development-contract.md#documentation-layout-owner-ruling-2026-11-08-5920)
+- <a id="issue--problem-tracking-mandatory"></a>[Issue & Problem Tracking](reference/development-contract.md#issue--problem-tracking-mandatory)
+- <a id="issue-分类与标签规则triage-必做"></a>[Issue 分类与标签规则](reference/development-contract.md#issue-分类与标签规则triage-必做)
+- <a id="version-bumps--one-version-one-commit-one-branch"></a>[Version Bumps](reference/development-contract.md#version-bumps--one-version-one-commit-one-branch)
