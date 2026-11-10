@@ -5,10 +5,21 @@
 // stashed original (availability), and when the original is gone the direct
 // send is refused locally (safety — the host's retry re-runs the decision).
 // Lanes without the hook keep today's byte-identical fall-back behavior.
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { installNativeFetchIntercept, withRestoredBody, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 import { createPrepareDirectSend, incrementalEnvelopeConversationId, INCREMENTAL_TURN_ID_HEADER, rememberOriginalBody, originalBodyForTurn, __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
+
+const previousNativeOpencode = process.env.BILI_NATIVE_OPENCODE;
+const previousNativeOmp = process.env.BILI_NATIVE_OMP;
+process.env.BILI_NATIVE_OPENCODE = "0";
+process.env.BILI_NATIVE_OMP = "0";
+after(() => {
+    if (previousNativeOpencode === undefined) delete process.env.BILI_NATIVE_OPENCODE;
+    else process.env.BILI_NATIVE_OPENCODE = previousNativeOpencode;
+    if (previousNativeOmp === undefined) delete process.env.BILI_NATIVE_OMP;
+    else process.env.BILI_NATIVE_OMP = previousNativeOmp;
+});
 
 const ORIGINAL_BODY = JSON.stringify({ model: "claude-test", max_tokens: 1024, messages: [{ role: "user", content: "hello" }] });
 const DELTA_BODY = JSON.stringify({ conversationId: "conv-1", sinceSeq: 3, path: "/v1/messages", request: { model: "claude-test" }, messages: [{ role: "assistant", content: "hi" }] });
@@ -378,7 +389,6 @@ test("#3304 pi guard: unreadable/stream body ⇒ as-is (cannot inspect, treat as
 // ── F. adapter instance wiring: the swap stashes the exact original ────────
 
 process.env.NODE_TEST_CONTEXT = "1";
-import { after } from "node:test";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
