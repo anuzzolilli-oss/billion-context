@@ -7,6 +7,8 @@
 
 | 文档 | 说明 |
 |---|---|
+| [开发细则](../reference/development-contract.md) | 按任务加载的强制规则；保留原有混合语言文本，不另行翻译以免规则含义漂移 |
+| [上下文维护](../reference/context-maintenance.md) | 双语加载层级、保真流程及待澄清的规则措辞 |
 | [Cindy 项目](cindy-project.zh-CN.md) / [English](cindy-project.md) | Andrew 分支仓库、Cindy 工作目录、运行边界和项目指令 |
 | [Cindy 工作流程](../reference/cindy-project.zh-CN.md) / [English](../reference/cindy-project.md) | 本地初始化、Windows 全量分片测试、验证及部署/回滚步骤 |
 | [README](../README.md) / [English](../README.zh-CN.md) | 项目入口：是什么、快速上手、架构总览 |

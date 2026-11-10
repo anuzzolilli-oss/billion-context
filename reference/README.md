@@ -5,8 +5,9 @@ information.
 
 | File | Description |
 |------|-------------|
+| [development-contract.md](development-contract.md) | Mandatory task-scoped policies extracted from AGENTS.md; original mixed-language wording preserved |
+| [context-maintenance.md](context-maintenance.md) | Canonical context tiers, preservation checks and unresolved policy wording (English / 中文) |
 | [architecture.md](architecture.md) | Module map (source files, entry points, dependencies) |
-| [architecture.zh-CN.md](architecture.zh-CN.md) | 模块映射（源文件、入口点、依赖关系） |
 | [design-decisions.md](design-decisions.md) | KDD full text — the numbered design-decision ledger that AGENTS.md §2 summarizes (append-only; KDD numbers are a stable public API) |
 | [triage.md](triage.md) | Issue triage rules — label groups, priority bar, A–N theme categories |
 | [env-vars.md](env-vars.md) | Environment variable discipline (category table, hard rules, rationale) |
