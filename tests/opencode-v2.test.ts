@@ -4,11 +4,17 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { once } from "node:events";
-import test from "node:test";
+import test, { after } from "node:test";
 
 process.env.NODE_ENV = "test";
 
-import biliOpencodePlugin from "../src/agent/opencode.ts";
+const previousProxy = process.env.BILLION_CONTEXT_PROXY;
+delete process.env.BILLION_CONTEXT_PROXY;
+after(() => {
+    if (previousProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
+    else process.env.BILLION_CONTEXT_PROXY = previousProxy;
+});
+const { default: biliOpencodePlugin } = await import("../src/agent/opencode.ts");
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI, RETRIEVE_TOOL_NAME, retrieveToolsFor } from "../src/compress-tool.ts";
 import { fetchManifest, fitNoticeDescription } from "../src/agent/shared.ts";
 
