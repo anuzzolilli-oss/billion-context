@@ -7,6 +7,8 @@
 
 | Doc | What it is |
 |---|---|
+| [Development contract](../reference/development-contract.md) | Mandatory task-scoped policy detail; original mixed-language wording preserved without a separate translation to avoid policy drift |
+| [Context maintenance](../reference/context-maintenance.md) | Bilingual context tiers, preservation procedure and unresolved policy wording |
 | [Cindy project](cindy-project.md) / [中文](cindy-project.zh-CN.md) | Andrew's fork, Cindy workspace, live-runtime boundary and project instructions |
 | [Cindy workflow](../reference/cindy-project.md) / [中文](../reference/cindy-project.zh-CN.md) | Local setup, full Windows test partitions, verification and deployment/rollback procedure |
 | [README](../README.md) / [中文](../README.zh-CN.md) | Project entry: what it is, quickstart, architecture overview |

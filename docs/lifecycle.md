@@ -233,6 +233,8 @@
 
 ## 5. 卫生记录
 
+- **2026-11-09 上下文分层 / context extraction（fork #21）**：AGENTS.md 保留常驻安全边界与 Tier A 后果，细则迁入 `reference/development-contract.md`，维护说明见 `reference/context-maintenance.md`。原章节锚点保留为指向细则的兼容入口；移除条件：至少两个版本后，仓内引用已更新且无外部链接反馈。Detailed policies remain mandatory; no runtime or release permission changes.
+
 - **2026-11-08 文档集中化（owner 指令 2026-11-08）**：14 个根级设计/配置文档一次性迁入 `docs/`（CONFIGURATION→`docs/configuration`、CLIENTS→`docs/clients`、TECHNICAL-NOTES→`docs/technical-notes`、MESSAGE-IDENTITY→`docs/message-identity`、SESSION-IDENTITY→`docs/session-identity`、PLUGIN→`docs/plugin-protocol`、LIFECYCLE→`docs/lifecycle`、UNIFIED_LOOP_SPEC→`docs/unified-loop-spec`、AUTO-MERGE-GUARDRAILS→`docs/auto-merge-guardrails`，含 zh-CN 对）；新 `docs/index.md` / `docs/index.zh-CN.md` 为文档总目录。原路径留单行重定向占位，**解除条件：1–2 个版本后且无外部链接反馈时删除占位**（届时同步删根级 stub）。CI `docs-sync` diff 路径与 `scripts/{config-surface-guard,lifecycle-ledger-guard}.mjs` 运行时路径、`package.json` files 数组已随迁。
 - **2026-10-15 远端分支卫生（#3249 执行）**：删除 origin 已合并远端分支 **1394 条**（1386 条 = 已合并 PR 的同仓 head 分支 + 8 条 = 完全并入 master 但无对应 PR 记录：`2026-08-08_release-v0.1.14`、`2026-09-26_opencode-zen-mitm`、`2026-09-30_responses-side-compaction`、`2026-10-04_plugin-fork-context-provenance`、`2026-10-13_lastmessages-tabling`、`chore/pages-enablement`、`fix/codex-custom-tool-call-text-protocol`、`revert-3189-pages-enablement`）。删除前核对：与 open PR head 交集为空。删除后 origin 剩 361 个 head（其中 128 条为 open PR 分支、201 条 closed-unmerged 且未并入 master、30 条无 PR 未并入 = 废弃工作，均不动）。另执行一次 `git worktree prune` 清掉失效 worktree 登记。
 - **2026-10-20 台账补登（本 PR）**：#3249 落地本台账时 `src/` 实际读取数已比登记数多 22（#3955 mysql、guardrails、#3128 网络预算、#3400 图像缩放、#3619 错峰、#3733 dsh compaction、#3756 snapshot shadow 等），守卫上线即全线红（master run 均被后续 push 取消所以未暴露）。本次 22 条全部补登（3 条 §1 + 19 条 §2）。
