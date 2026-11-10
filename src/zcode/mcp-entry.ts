@@ -51,6 +51,7 @@ export interface ZcodeWatchdogState {
 export interface MutableZcodeWatchdogState extends ZcodeWatchdogState {
     origin: string;
     failures: number;
+    stopped?: boolean;
 }
 
 function buildEnsureOpts(): Parameters<typeof ensureProxyRunning>[0] {
@@ -78,6 +79,7 @@ async function defaultEnsure(opts: Parameters<typeof ensureProxyRunning>[0]): Pr
  *  ensure (transient spawn/EADDRINUSE) leaves it hot so the next tick retries
  *  immediately rather than re-accumulating to the limit (~90s). */
 export async function zcodeWatchdogTick(state: MutableZcodeWatchdogState, externallyOwned: boolean, deps: ZcodeWatchdogDeps, log: (msg: string) => void): Promise<void> {
+    if (state.stopped) return;
     const probe = deps.probe ?? probeProxyHealth;
     const repair = deps.repair ?? ((selfOrigin: string) => repairSharedStoreDrift({ selfOrigin, log }));
     if (await probe(state.origin)) {
@@ -85,6 +87,7 @@ export async function zcodeWatchdogTick(state: MutableZcodeWatchdogState, extern
     } else if (state.failures + 1 < (deps.failureLimit ?? WATCHDOG_FAILURE_LIMIT)) {
         state.failures += 1;
     } else {
+        if (state.stopped) return;
         if (externallyOwned) {
             log(`attached proxy ${state.origin} unhealthy — user-owned attach posture, waiting for it to recover`);
             state.failures = 0;
@@ -109,39 +112,56 @@ export async function zcodeWatchdogTick(state: MutableZcodeWatchdogState, extern
     await repair(state.origin);
 }
 
-function startWatchdog(
+export function startWatchdog(
     state: MutableZcodeWatchdogState,
     externallyOwned: boolean,
     log: (msg: string) => void,
     deps: ZcodeWatchdogDeps = {},
-): void {
-    let busy = false;
+): () => Promise<void> {
+    let pending: Promise<void> | undefined;
     const timer = setInterval(() => {
-        if (busy) return;
-        busy = true;
-        void zcodeWatchdogTick(state, externallyOwned, deps, log)
+        if (state.stopped || pending) return;
+        pending = zcodeWatchdogTick(state, externallyOwned, deps, log)
             .catch((err) => log(`watchdog error: ${err instanceof Error ? err.message : String(err)}`))
-            .finally(() => { busy = false; });
+            .finally(() => { pending = undefined; });
     }, deps.intervalMs ?? WATCHDOG_INTERVAL_MS);
     timer.unref?.();
+    return async () => { state.stopped = true; clearInterval(timer); await pending; };
 }
 
-function installExitHandoff(state: { origin: string }, log: (msg: string) => void): void {
-    let started = false;
-    const handoff = (exitCode: number | undefined) => {
-        if (started) return;
-        started = true;
-        const timeout = new Promise<void>((resolve) => setTimeout(resolve, HANDOFF_TIMEOUT_MS).unref?.());
-        void Promise.race([
-            handoffZcodeRoutingOnExit({ ownOrigin: state.origin, log }).catch((err) => {
-                log(`exit handoff failed: ${err instanceof Error ? err.message : String(err)}`);
-            }),
-            timeout,
-        ]).then(() => { if (exitCode !== undefined) process.exit(exitCode); });
+export function installExitHandoff(state: { origin: string }, log: (msg: string) => void, deps: {
+    events?: { once(event: string, listener: () => void): unknown };
+    handoff?: () => Promise<unknown>;
+    exit?: (code: number) => void;
+    timeoutMs?: number;
+} = {}): () => Promise<void> {
+    let pending: Promise<void> | undefined;
+    const finish = () => pending ??= (async () => {
+        try {
+            await (deps.handoff ? deps.handoff() : handoffZcodeRoutingOnExit({ ownOrigin: state.origin, log }));
+        } catch (err) {
+            log(`exit handoff failed: ${err instanceof Error ? err.message : String(err)}`);
+        } finally {
+            await closeLogger();
+        }
+    })();
+    const signal = async (code: number) => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            await Promise.race([finish(), new Promise<void>((resolve) => {
+                timer = setTimeout(resolve, deps.timeoutMs ?? HANDOFF_TIMEOUT_MS);
+                timer.unref?.();
+            })]);
+        } finally {
+            if (timer) clearTimeout(timer);
+            (deps.exit ?? process.exit)(code);
+        }
     };
-    process.once("SIGTERM", () => handoff(143));
-    process.once("SIGINT", () => handoff(130));
-    process.once("beforeExit", () => handoff(undefined));
+    const events = deps.events ?? process;
+    events.once("SIGTERM", () => { void signal(143); });
+    events.once("SIGINT", () => { void signal(130); });
+    events.once("beforeExit", () => { void finish(); });
+    return finish;
 }
 
 /** Candidate proxies an idle/degraded entry may still serve through
@@ -183,7 +203,7 @@ async function serveDegraded(reason: string, log: (msg: string) => void): Promis
             const tools = await fetchManifest(origin, "anthropic");
             if (tools.length > 0) {
                 log(`degraded: serving the ACP tools via the existing proxy at ${origin} — native routing is inactive, compression rides whatever traffic that proxy already intercepts (cert-MITM)`);
-                runMcpStdio();
+                runMcpStdio({ onDrained: closeLogger });
                 return;
             }
         } catch {
@@ -240,9 +260,9 @@ export async function main(): Promise<void> {
     // #1622: the watchdog respawn path must re-route with the SAME policy
     // (BILI_ZCODE_ROUTE / providers direct) — not the hardcoded default.
     const state = { origin: applied.origin, policy: zcodePolicyFromEnv(process.env), failures: 0 };
-    startWatchdog(state, bootstrap.externallyOwned, log);
-    installExitHandoff(state, log);
-    runMcpStdio();
+    const stopWatchdog = startWatchdog(state, bootstrap.externallyOwned, log);
+    const handoff = installExitHandoff(state, log);
+    runMcpStdio({ onEnd: stopWatchdog, onDrained: handoff });
 }
 
 if (process.argv[1] && /(?:^|[\\/])mcp-entry\.(?:ts|js)$/.test(process.argv[1])) {

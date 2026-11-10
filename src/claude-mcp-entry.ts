@@ -13,7 +13,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveProxyOrigin, runMcpStdio } from "./mcp.js";
-import { configureLogger, log as teeLog } from "./logger.js";
+import { closeLogger, configureLogger, log as teeLog } from "./logger.js";
 import { defaultLogFile } from "./paths.js";
 import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning, healthUrl } from "./launcher.js";
 import { chooseWatchdogParentPid, planClaudeNativeBootstrap } from "./claude-native-bootstrap.js";
@@ -55,6 +55,7 @@ export interface WatchdogState {
 
 export interface MutableWatchdogState extends WatchdogState {
     failures: number;
+    stopped?: boolean;
 }
 
 /** One watchdog pass: healthy → reset; dead `failureLimit` times in a row →
@@ -66,6 +67,7 @@ export interface MutableWatchdogState extends WatchdogState {
  *  the base URL claude loaded at startup, the same #1660 constraint as the
  *  hook) and follows it in our own BILI_MCP_PROXY pin so bili tools keep working. */
 export async function watchdogTick(state: MutableWatchdogState, plan: { port: number; strict: boolean }, deps: WatchdogDeps, log: (msg: string) => void): Promise<void> {
+    if (state.stopped) return;
     const probeFn = deps.probe ?? probeProxyHealth;
     const limit = deps.failureLimit ?? WATCHDOG_FAILURE_LIMIT;
     if (await probeFn(state.origin)) {
@@ -73,7 +75,7 @@ export async function watchdogTick(state: MutableWatchdogState, plan: { port: nu
         return;
     }
     state.failures += 1;
-    if (state.failures < limit) return;
+    if (state.stopped || state.failures < limit) return;
     const ensure = deps.ensure ?? ensureProxyRunning;
     const handle = await ensure(
         {
@@ -108,20 +110,19 @@ export async function watchdogTick(state: MutableWatchdogState, plan: { port: nu
     state.failures = 0;
 }
 
-export function startWatchdog(state: MutableWatchdogState, plan: { port: number; strict: boolean }, log: (msg: string) => void, deps: WatchdogDeps = {}): NodeJS.Timeout {
-    let busy = false;
+export function startWatchdog(state: MutableWatchdogState, plan: { port: number; strict: boolean }, log: (msg: string) => void, deps: WatchdogDeps = {}): () => Promise<void> {
+    let pending: Promise<void> | undefined;
     const timer = setInterval(() => {
-        if (busy) return;
-        busy = true;
-        void watchdogTick(state, plan, deps, log)
+        if (state.stopped || pending) return;
+        pending = watchdogTick(state, plan, deps, log)
             .catch((err) => log(`watchdog error: ${err instanceof Error ? err.message : String(err)}`))
-            .finally(() => { busy = false; });
+            .finally(() => { pending = undefined; });
     }, deps.intervalMs ?? WATCHDOG_INTERVAL_MS);
     timer.unref?.();
-    return timer;
+    return async () => { state.stopped = true; clearInterval(timer); await pending; };
 }
 
-export async function main(opts: WatchdogDeps & { runStdio?: () => void } = {}): Promise<void> {
+export async function main(opts: WatchdogDeps & { runStdio?: typeof runMcpStdio } = {}): Promise<void> {
     if (process.env.NODE_TEST_CONTEXT !== undefined) return;
     configureLogger(defaultLogFile());
     const log = (msg: string) => teeLog("info", `[bili-claude-mcp] ${msg}`);
@@ -130,14 +131,14 @@ export async function main(opts: WatchdogDeps & { runStdio?: () => void } = {}):
         // attach (BILLION_CONTEXT_PROXY / BILI_PROVIDER_REWRITES) or passthrough
         // (opt-out): someone else owns routing — serve tools only, NEVER respawn
         // (a second proxy beside an attach target would split sessions across two).
-        (opts.runStdio ?? runMcpStdio)();
+        (opts.runStdio ?? runMcpStdio)({ onDrained: closeLogger });
         return;
     }
     // Track what THIS running claude dialed: the managed block's last-repinned
     // URL wins (settings.json), then the installer pin / live discovery.
     const state: MutableWatchdogState = { origin: readClaudeManagedBaseUrl() ?? resolveProxyOrigin(), failures: 0 };
-    startWatchdog(state, plan, log, opts);
-    (opts.runStdio ?? runMcpStdio)();
+    const stopWatchdog = startWatchdog(state, plan, log, opts);
+    (opts.runStdio ?? runMcpStdio)({ onEnd: stopWatchdog, onDrained: closeLogger });
 }
 
 if (process.argv[1] && /(?:^|[\\/])claude-mcp-entry\.(?:ts|js)$/.test(process.argv[1])) {

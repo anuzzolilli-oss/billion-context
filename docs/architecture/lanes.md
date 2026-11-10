@@ -25,9 +25,13 @@ This module answers three questions per request: who carried it in (which host, 
 
 **Processing lanes.** See the [fastpaths module](./fastpaths.md) for the three fast lanes; legacy full-resend is the default for every shape and the fallback safety net for all of them.
 
+## MCP child shutdown
+
+The shared stdio server (`src/mcp.ts`) owns request admission and draining. On stdin EOF it stops accepting requests and stops future caller watchdog ticks, then lets accepted calls and their background session registration finish under their existing timeout/retry limits. A stopped watchdog settles work already underway without starting new recovery after a pending probe completes. Caller cleanup waits for that work before changing routing; native Zcode hands off its owned route once. A confirmed stdout disconnect does not abandon accepted work or routing cleanup. The child then exits naturally, allowing asynchronous runtime teardown instead of forcing `process.exit()` on EOF. Signal handling retains its existing exit-code behavior. This lifecycle is separate from model-wire compression mode and does not cancel compression already submitted to the proxy.
+
 ## Key entries
 
-`src/agent/plugin.ts` (x-bili-plugin lane) · `src/agent/dsh-*` · `src/agent/pi*.ts` · `src/agent/opencode*.ts` · `src/agent/native-intercept.ts` · `src/server/lane-decisions.ts` · `src/launcher.ts` (`bili <client>` posture) · `tests/lane-decisions-matrix.test.ts`
+`src/agent/plugin.ts` (x-bili-plugin lane) · `src/agent/dsh-*` · `src/agent/pi*.ts` · `src/agent/opencode*.ts` · `src/agent/native-intercept.ts` · `src/server/lane-decisions.ts` · `src/launcher.ts` (`bili <client>` posture) · `src/mcp.ts` (stdio drain) · `src/claude-mcp-entry.ts` / `src/kimi/native-mcp.ts` / `src/zcode/mcp-entry.ts` (caller cleanup) · `tests/lane-decisions-matrix.test.ts`
 
 ## Related
 

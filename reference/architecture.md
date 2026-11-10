@@ -179,7 +179,7 @@ billion-context/
 │   ├── pi-channel.ts             # pi npm-copy self-refresh spec form
 │   ├── claude-native-bootstrap.ts # Claude native bootstrap hook entry
 │   ├── claude-subagent-hook.ts  # Claude SubagentStart hook: mint per-dispatch lane token (#5095)
-│   ├── mcp.ts                    # Plugin-in-launcher MCP shell (spawn-time env injection)
+│   ├── mcp.ts                    # Plugin-in-launcher MCP shell; EOF admission stop, request drain, caller cleanup
 │   ├── loop/                     # Unified compress loop (wire-independent core)
 │   │   ├── index.ts              #   Stream-failure presentation options (#1455)
 │   │   ├── core.ts               #   Protocol-neutral event model + tool adjudication
@@ -228,13 +228,13 @@ billion-context/
 │   │   └── dsh-native-client-react-shim.d.ts #  Ambient "react" types for the dsh bundle (#1590)
 │   ├── kimi/                     # Kimi native lane
 │   │   ├── bootstrap-hook.ts     #   SessionStart attach-only bootstrap (#963)
-│   │   ├── native-mcp.ts         #   Per-session native MCP entry
+│   │   ├── native-mcp.ts         #   Per-session native MCP entry with EOF watchdog drain
 │   │   ├── native.ts             #   config.toml origin routing rewrite (idempotent)
 │   │   └── toml-edit.ts          #   Managed TOML block add/remove
 │   ├── zcode/                    # ZCode native lane
 │   │   ├── bootstrap-hook.ts     #   SessionStart attach-only bootstrap (#1145)
 │   │   ├── json-edit.ts          #   Provider config JSON managed edit
-│   │   ├── mcp-entry.ts          #   Idle/degraded entry candidate proxies (#1892)
+│   │   ├── mcp-entry.ts          #   Idle/degraded/native entry; EOF watchdog drain and routing handoff (#1892)
 │   │   └── native.ts             #   Routing scope/exemptions policy (#1622)
 │   ├── agent-providers.ts        # In-memory agent-registry provider recipes; file recipes win (#2336)
 │   ├── announcements.ts          # Notice surface registry: record schema + gates shared by builtin/remote/local (#5548)
@@ -242,7 +242,7 @@ billion-context/
 │   ├── attach-heartbeat.ts       # Silence alarm for a hot-at-attach session with zero observed requests (#5408)
 │   ├── auto-mode-forge.ts        # Local forged verdicts for the Claude Code auto-mode safety classifier (#2740)
 │   ├── cache-keepalive.ts        # Idle prompt-cache TTL keepalive pings replaying the last egress body (#3376)
-│   ├── claude-mcp-entry.ts       # Per-session Claude native MCP server + mid-session proxy watchdog (#1821)
+│   ├── claude-mcp-entry.ts       # Per-session Claude native MCP server + EOF-owned watchdog drain (#1821)
 │   ├── claude-transcript-lineage.ts # Resume lineage from Claude Code transcript forkedFrom markers (#1486)
 │   ├── client-ua-registry.ts     # Bounded in-memory registry of recently observed client user-agents (#4649)
 │   ├── context-view.ts           # Machine-readable context view for programmatic consumers (#3862)

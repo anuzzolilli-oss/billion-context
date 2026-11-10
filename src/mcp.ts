@@ -32,6 +32,7 @@
 // the proxy never saw falls back to the existing ladder unchanged.
 
 import fs from "node:fs";
+import { log as loggerLog } from "./logger.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
@@ -106,8 +107,9 @@ let conversationId = CONVERSATION_FROM_ENV;
 // binding plus any per-call ids seen so far (issue-once each).
 const registeredConversations = new Set<string>();
 let initialized = false;
+let outputDisconnected = false;
 function send(msg: unknown): void {
-    process.stdout.write(JSON.stringify(msg) + "\n");
+    if (!outputDisconnected) process.stdout.write(JSON.stringify(msg) + "\n");
 }
 
 function sendResult(id: JsonRpcId, result: unknown): void {
@@ -287,7 +289,7 @@ async function handleMessage(msg: {
         _meta?: { ui?: { sessionId?: string }; threadId?: unknown; "claudecode/toolUseId"?: unknown };
         [k: string]: unknown;
     };
-}): Promise<void> {
+}, trackBackground: (work: Promise<void>) => void): Promise<void> {
     const { id = null, method } = msg;
     const params = typeof msg.params === "object" && msg.params !== null ? msg.params : {};
     switch (method) {
@@ -314,7 +316,7 @@ async function handleMessage(msg: {
                     // Identity-mode binding survives any arrival order —
                     // respond immediately so pipelined hosts are not stuck
                     // behind the register round-trip.
-                    void registerFetch.catch(() => {});
+                    trackBackground(registerFetch.then(() => {}, () => {}));
                 } else {
                     // Headless binding is order-sensitive: the register MUST
                     // land before the host's first model request, and hosts
@@ -444,10 +446,29 @@ async function handleMessage(msg: {
             sendError(id, -32601, `method not found: ${method ?? "(none)"}`);
     }
 }
-async function mcpMain(): Promise<void> {
+function mcpMain(opts: McpStdioOptions = {}): void {
+    process.stdout.on("error", (err: NodeJS.ErrnoException) => {
+        if (err.code !== "EPIPE" && err.code !== "ECONNRESET" && err.code !== "ERR_STREAM_DESTROYED") throw err;
+        outputDisconnected = true;
+    });
     let buf = "";
+    let ended = false;
+    const pending = new Set<Promise<void>>();
+    const reportFailure = (err: unknown) => {
+        loggerLog("error", `[bili-mcp] shutdown/request failed: ${err instanceof Error ? err.message : String(err)}`);
+        process.exitCode = 1;
+    };
+    const track = (work: Promise<void>, requestId?: JsonRpcId) => {
+        const settled = work.catch((err: unknown) => {
+            reportFailure(err);
+            if (requestId !== undefined) sendError(requestId, -32603, "Internal error");
+        });
+        pending.add(settled);
+        void settled.then(() => pending.delete(settled));
+    };
     process.stdin.setEncoding("utf8");
     process.stdin.on("data", (chunk: string) => {
+        if (ended) return;
         buf += chunk;
         let nl: number;
         while ((nl = buf.indexOf("\n")) >= 0) {
@@ -461,11 +482,24 @@ async function mcpMain(): Promise<void> {
                 continue;
             }
             if (parsed && typeof parsed === "object") {
-                void handleMessage(parsed as Parameters<typeof handleMessage>[0]);
+                const msg = parsed as Parameters<typeof handleMessage>[0];
+                const id = typeof msg.id === "string" || typeof msg.id === "number" || msg.id === null ? msg.id : undefined;
+                track(handleMessage(msg, track), id);
             }
         }
     });
-    process.stdin.on("end", () => process.exit(0));
+    process.stdin.once("end", () => {
+        ended = true;
+        buf = "";
+        // Awaiting a promise alone does not keep Node alive (fetch deadlines can be unref'd).
+        const keepAlive = setInterval(() => {}, 1000);
+        const finish = async () => {
+            try { await opts.onEnd?.(); } catch (err) { reportFailure(err); }
+            await Promise.allSettled(pending);
+            try { await opts.onDrained?.(); } catch (err) { reportFailure(err); }
+        };
+        void finish().catch(reportFailure).finally(() => clearInterval(keepAlive));
+    });
 }
 
 /** Set when this shim serves WITHOUT a live proxy behind it (#1892,
@@ -475,10 +509,18 @@ async function mcpMain(): Promise<void> {
  *  instead of seeing the child die pre-initialize. */
 let degradedReason: string | undefined;
 
+export interface McpStdioOptions {
+    degraded?: string;
+    /** Stop owned background work immediately at EOF; await any in-flight work. */
+    onEnd?: () => void | Promise<void>;
+    /** Finalize only after accepted requests and onEnd have settled. */
+    onDrained?: () => void | Promise<void>;
+}
+
 /** CLI entry (`bili mcp`): the stdio loop keeps the process alive. */
-export function runMcpStdio(opts: { degraded?: string } = {}): void {
+export function runMcpStdio(opts: McpStdioOptions = {}): void {
     degradedReason = opts.degraded;
-    void mcpMain();
+    mcpMain(opts);
 }
 
 // Direct entry (dist/mcp.js spawned by the injected MCP config, or the ts

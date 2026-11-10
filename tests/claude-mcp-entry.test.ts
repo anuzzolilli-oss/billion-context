@@ -4,7 +4,8 @@
 // installer's MCP face migration (legacy dist/mcp.js swap, current skip,
 // foreign registration untouched).
 
-import { test } from "node:test";
+import { afterEach, beforeEach, test } from "node:test";
+import { closeLogger } from "../src/logger.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -20,6 +21,14 @@ import { rmrf } from "./tmp-rm.ts";
 
 const ORIGIN = `http://127.0.0.1:${ZONE_PORT_BASE}`;
 const DRIFTED = `http://127.0.0.1:${ZONE_PORT_BASE + 1}`;
+
+let savedEnv: NodeJS.ProcessEnv;
+beforeEach(() => { savedEnv = { ...process.env }; });
+afterEach(() => {
+    closeLogger();
+    for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
+    Object.assign(process.env, savedEnv);
+});
 
 function sandbox(): { dir: string; settings: string; mcpJson: string } {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-mcp-"));
@@ -205,16 +214,92 @@ test("watchdogTick: a failed bring-up keeps the counter hot — immediate retry 
     assert.equal(f.state.failures, 0);
 });
 
+test("startWatchdog stop blocks recovery from an outstanding failed probe", { timeout: 5000 }, async () => {
+    let release!: (healthy: boolean) => void;
+    let entered!: () => void;
+    const probing = new Promise<void>((resolve) => { entered = resolve; });
+    let recoveries = 0;
+    const stop = startWatchdog({ origin: ORIGIN, failures: 2 }, { port: 0, strict: false }, () => {}, {
+        intervalMs: 5,
+        probe: () => { entered(); return new Promise<boolean>((resolve) => { release = resolve; }); },
+        ensure: async () => { recoveries += 1; return { origin: ORIGIN, port: 0 }; },
+    });
+    try {
+        await probing;
+        const stopped = stop();
+        release(false);
+        await stopped;
+        assert.equal(recoveries, 0);
+    } finally { release?.(false); await stop(); }
+});
+
+test("startWatchdog stop joins recovery already underway", { timeout: 5000 }, async () => {
+    let release!: () => void;
+    let entered!: () => void;
+    const recovering = new Promise<void>((resolve) => { entered = resolve; });
+    const state = { origin: ORIGIN, failures: 2 };
+    let joined = false;
+    const stop = startWatchdog(state, { port: 0, strict: false }, () => {}, {
+        intervalMs: 5,
+        probe: async () => false,
+        ensure: async () => {
+            entered();
+            await new Promise<void>((resolve) => { release = resolve; });
+            return { origin: DRIFTED, port: 0 };
+        },
+        repin: () => [],
+    });
+    try {
+        await recovering;
+        const stopped = stop().then(() => { joined = true; });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        assert.equal(joined, false);
+        release();
+        await stopped;
+        assert.equal(state.origin, DRIFTED);
+    } finally { release?.(); await stop(); }
+});
+
+for (const rejects of [false, true]) {
+    test(`Claude EOF hook waits for an active tick and prevents future ticks (rejects=${rejects})`, async (t) => {
+        const box = sandbox();
+        t.after(() => { closeLogger(); rmrf(box.dir); });
+        let release!: () => void;
+        let entered!: () => void;
+        const blocked = new Promise<void>((resolve) => { release = resolve; });
+        const started = new Promise<void>((resolve) => { entered = resolve; });
+        let calls = 0;
+        let hooks: Parameters<NonNullable<NonNullable<Parameters<typeof main>[0]>["runStdio"]>>[0];
+        await withEnv({ NODE_TEST_CONTEXT: undefined, BILLION_CONTEXT_PROXY: undefined, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_CLAUDE: undefined, BILLION_CONTEXT_PLUGIN: undefined, BILI_PROXY_PORT: undefined }, async () => {
+            await main({ intervalMs: 1, probe: async () => { calls++; entered(); await blocked; if (rejects) throw new Error("blocked probe failed"); return true; }, runStdio: (opts) => { hooks = opts; } });
+            const deadline = setTimeout(() => entered(), 1000);
+            try {
+                assert.ok(hooks?.onEnd);
+                await started;
+                assert.equal(calls, 1);
+                let stopped = false;
+                const drain = Promise.resolve(hooks.onEnd()).then(() => { stopped = true; });
+                await new Promise((resolve) => setTimeout(resolve, 15));
+                assert.equal(stopped, false);
+                release();
+                await drain;
+                await new Promise((resolve) => setTimeout(resolve, 15));
+                assert.equal(calls, 1);
+            } finally { clearTimeout(deadline); release(); await hooks?.onEnd?.(); await hooks?.onDrained?.(); }
+        });
+    });
+}
+
 test("startWatchdog: fires on repeated death and survives via unref'd timer", async () => {
     const f = tickFixture();
     const state: MutableWatchdogState = { origin: ORIGIN, failures: 0 };
-    const timer = startWatchdog(state, { port: ZONE_PORT_BASE, strict: false }, (m) => f.logs.push(m), { ...f.deps, intervalMs: 5 });
+    const stop = startWatchdog(state, { port: ZONE_PORT_BASE, strict: false }, (m) => f.logs.push(m), { ...f.deps, intervalMs: 5 });
     try {
         const deadline = Date.now() + 5000;
         while (f.ensureCalls.length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
         assert.ok(f.ensureCalls.length >= 1, "watchdog brought the proxy back");
     } finally {
-        clearInterval(timer);
+        await stop();
     }
 });
 
