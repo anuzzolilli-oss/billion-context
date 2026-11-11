@@ -164,6 +164,175 @@ async function readResponseText(response: Response): Promise<string> {
     return Buffer.concat(chunks).toString();
 }
 
+/** One background generation per session. The task only fetches and parses into
+ *  this in-memory slot; every session mutation happens later, on a request that
+ *  holds the session lock. */
+interface MaintenanceJob {
+    done: boolean;
+    startRef: string;
+    endRef: string;
+    ids: string[];
+    attempt: number;
+    measurement: Record<string, unknown>;
+    started: number;
+    finished?: number;
+    content?: string;
+    summary?: string;
+    summaryMaxChars?: number;
+    stage: string;
+    failureKind?: string;
+    errorName?: string;
+    httpStatus?: number;
+    headersMs?: number;
+    responseMs?: number;
+    returnedModel?: string;
+    finishReason?: string;
+    usage: { inputTokens?: number; outputTokens?: number; reasoningTokens?: number };
+}
+
+const jobs = new WeakMap<Prepared["session"], MaintenanceJob>();
+const generating = new Set<Promise<void>>();
+const generationAborts = new WeakMap<ProxyOptions, Set<AbortController>>();
+
+/** Cancel this server's in-flight background generations (server close). */
+export function stopBoundedMaintenance(opts: ProxyOptions): void {
+    for (const controller of generationAborts.get(opts) ?? []) controller.abort();
+}
+
+export async function _boundedMaintenanceIdleForTest(): Promise<void> {
+    while (generating.size > 0) await Promise.all([...generating]);
+}
+
+async function generate(job: MaintenanceJob, run: {
+    url: string; headers: Record<string, string>; proxyUrl: string | undefined; payload: string; timeoutMs: number;
+    model: string | undefined; cancel: AbortSignal; sessionId: string; log: (level: string, message: string) => void;
+}): Promise<void> {
+    const deadline = AbortSignal.any([run.cancel, AbortSignal.timeout(run.timeoutMs)]);
+    try {
+        const { response, clearTimer } = await fetchWithTimeout(run.url, {
+            method: "POST", headers: { ...run.headers, "content-type": "application/json" },
+            body: run.payload, dispatcher: proxyDispatcher(run.proxyUrl),
+        }, run.timeoutMs, deadline);
+        job.headersMs = Date.now() - job.started;
+        job.httpStatus = response.status;
+        job.stage = "read-response";
+        let json: Record<string, unknown>;
+        const settle429 = response.status === 429
+            ? beginProvisionalUpstreamThrottle429(run.url, run.headers, response.headers.get("retry-after"), Date.now(), run.model)
+            : undefined;
+        if (response.status !== 429) noteUpstreamThrottleResolved(run.url, run.headers, response.status, Date.now(), run.model);
+        try {
+            if (!response.ok) {
+                job.failureKind = "http";
+                if (settle429) settle429(throttle429ModelScope(response.status, run.model, await readResponseText(response)));
+                else await response.body?.cancel();
+                throw new Error("maintenance HTTP failure");
+            }
+            json = JSON.parse(await readResponseText(response)) as Record<string, unknown>;
+        } finally { settle429?.(); clearTimer(); }
+        job.responseMs = Date.now() - job.started;
+        job.stage = "validate";
+        if (deadline.aborted) throw new Error("maintenance aborted");
+        job.returnedModel = measuredIdentifier(json.model);
+        const measured = json.usage as { prompt_tokens?: number; completion_tokens?: number; completion_tokens_details?: { reasoning_tokens?: number } } | undefined;
+        job.usage = { inputTokens: measured?.prompt_tokens, outputTokens: measured?.completion_tokens, reasoningTokens: measured?.completion_tokens_details?.reasoning_tokens };
+        const choices = json.choices as { finish_reason?: string; message?: { tool_calls?: { id?: string; type?: string; function?: { name?: string; arguments?: string } }[] } }[] | undefined;
+        job.finishReason = measuredIdentifier(choices?.[0]?.finish_reason);
+        if (choices?.[0]?.finish_reason === "length") throw new Error("truncated maintenance");
+        const calls = choices?.[0]?.message?.tool_calls;
+        if (!Array.isArray(calls) || calls.length !== 1 || calls[0].type !== "function" || calls[0].function?.name !== "compress") throw new Error("expected one compress call");
+        const input = JSON.parse(calls[0].function.arguments ?? "") as { content?: unknown };
+        if (typeof input.content !== "string") throw new Error("invalid compression content");
+        const parsed = parseCompressInput({ content: input.content }, undefined, { quiet: true });
+        if (!parsed.diagnostics.ok || parsed.diagnostics.invalidItems > 0 || parsed.ranges.length !== 1
+            || parsed.ranges[0].startRef !== job.startRef || parsed.ranges[0].endRef !== job.endRef) throw new Error("maintenance range mismatch");
+        job.summary = parsed.ranges[0].summary;
+        job.summaryMaxChars = parsed.ranges[0].summaryMaxChars;
+        job.content = input.content;
+        job.stage = "generated";
+    } catch (error) {
+        job.failureKind = run.cancel.aborted ? "shutdown" : deadline.aborted ? "deadline" : job.failureKind ?? job.stage;
+        job.errorName = error instanceof Error ? measuredIdentifier(error.name) : undefined;
+    } finally {
+        job.finished = Date.now();
+        job.done = true;
+        run.log(job.content === undefined ? "warn" : "info",
+            `[${run.sessionId}] [bounded-maintenance] generation ${job.content === undefined ? "failed" : "ready"}; durationMs=${job.finished - job.started} stage=${job.stage}${job.failureKind ? ` failureKind=${job.failureKind}` : ""}; applies on a later request`);
+    }
+}
+
+/** Runs under the session lock on a later request: re-validates the finished
+ *  generation against the CURRENT history and commits it through the engine. */
+async function collect(job: MaintenanceJob, args: Parameters<typeof maybeRunBoundedMaintenance>[0]): Promise<boolean> {
+    const { prepared, core, config, signal, log } = args;
+    const session = prepared.session;
+    const before = new Set(session.state.blocks.map(b => b.blockId));
+    const finished = job.finished ?? Date.now();
+    let outcome = "failed";
+    let blockIds: string[] = [];
+    let stage = job.stage;
+    let failureKind = job.failureKind;
+    let errorName = job.errorName;
+    try {
+        if (job.content === undefined || job.summary === undefined) throw new Error("maintenance generation failed");
+        stage = "validate";
+        // The session revision necessarily advances between the launching and
+        // the collecting request, so staleness is judged on identity: the same
+        // refs must still resolve to the same content-hash message ids, and the
+        // kernel preview must still cover exactly those originals.
+        const refs = session.state.messageRefs.byRef;
+        const start = prepared.originalMessages.findIndex(message => message.id === refs[job.startRef]);
+        const end = prepared.originalMessages.findIndex(message => message.id === refs[job.endRef]);
+        const originals = start >= 0 && end >= start ? prepared.originalMessages.slice(start, end + 1) as BiliMessage[] : [];
+        if (signal.aborted || originals.length !== job.ids.length || originals.some((message, index) => message.id !== job.ids[index])
+            || !exactCoverage(prepared, core, config, originals, job.startRef, job.endRef, job.summary, job.summaryMaxChars)) {
+            failureKind = signal.aborted ? undefined : "stale";
+            throw new Error("maintenance coverage changed");
+        }
+        stage = "compress";
+        const result = await executeProxyToolAsync("compress", { content: job.content }, {
+            core, config, session, messages: prepared.processedMessages, archiveMessages: prepared.originalMessages,
+            compressMessages: prepared.originalMessages,
+            log: message => log("info", `[${session.id}] [bounded-maintenance] ${message}`),
+        }, undefined, undefined, signal);
+        const created = session.state.blocks.filter(b => !before.has(b.blockId));
+        blockIds = created.map(b => b.blockId);
+        const applied = result.outcome === "applied" && created.length > 0;
+        outcome = applied ? "applied" : created.length > 0 ? "partial" : "not-applied";
+        stage = "complete";
+        log(applied ? "info" : "warn", `[${session.id}] [bounded-maintenance] ${outcome}; blocksCreated=${created.length}`);
+        return created.length > 0;
+    } catch (error) {
+        failureKind = signal.aborted ? "client-abort" : failureKind ?? stage;
+        errorName ??= error instanceof Error ? measuredIdentifier(error.name) : undefined;
+        log("warn", `[${session.id}] [bounded-maintenance] failed; the original task continued without waiting for it`);
+        return session.state.blocks.some(b => !before.has(b.blockId));
+    } finally {
+        const blocksCreated = session.state.blocks.filter(b => !before.has(b.blockId)).length;
+        session.metadata.boundedMaintenanceRetry = {
+            pending: blocksCreated === 0 && failureKind !== "client-abort",
+            attempts: job.attempt, nextAttemptAt: finished + (job.attempt === 1 ? 30000 : 60000),
+        } satisfies MaintenanceRetry;
+        session.metadata.boundedMaintenanceLast = {
+            durationMs: finished - job.started,
+            outcome,
+            blocksCreated,
+            blockIds,
+            ...job.measurement, stage, failureKind, errorName, httpStatus: job.httpStatus, headersMs: job.headersMs, responseMs: job.responseMs,
+            returnedModel: job.returnedModel, finishReason: job.finishReason,
+            ...job.usage,
+            collectedAfterMs: Date.now() - job.started,
+        };
+        markDirty(session);
+        log("info", `[${session.id}] [bounded-maintenance] durationMs=${finished - job.started}`);
+        log("info", `[${session.id}] [bounded-maintenance] measurement=${JSON.stringify(session.metadata.boundedMaintenanceLast)}`);
+    }
+}
+
+/** Off the request path: a qualifying request LAUNCHES one background
+ *  generation and is forwarded unchanged (returns false); a later request for
+ *  the same session COLLECTS the finished result and returns true when it
+ *  created blocks, so the caller re-prepares with the fold. */
 export async function maybeRunBoundedMaintenance(args: {
     prepared: Prepared;
     req: http.IncomingMessage;
@@ -182,16 +351,23 @@ export async function maybeRunBoundedMaintenance(args: {
         && saved.attempts >= 1 && saved.attempts <= MAX_MAINTENANCE_ATTEMPTS && Number.isFinite(saved.nextAttemptAt) ? saved : undefined;
     const freshNudge = prepared.nudgeOutcome === "injected" && prepared.nudge?.tier === 1;
     if (!policy || signal.aborted || attemptedRequests.has(req) || prepared.protocol !== "openai" || !prepared.pluginMode
-        || (!freshNudge && !retry?.pending)
         || externalSummaryEnabled(config)) return false;
+    const job = jobs.get(session);
+    if (job && !job.done) return false;
+    if (!job && !freshNudge && !retry?.pending) return false;
     const gate = unpromptedGateOf(session);
     if (gate.requireNudge && (!gate.armed || prepared.nudgeOutcome !== "injected")) return false;
-    if (retry?.pending && (Date.now() < retry.nextAttemptAt || (retry.attempts >= MAX_MAINTENANCE_ATTEMPTS && !freshNudge))) return false;
+    if (!job && retry?.pending && (Date.now() < retry.nextAttemptAt || (retry.attempts >= MAX_MAINTENANCE_ATTEMPTS && !freshNudge))) return false;
     const body = JSON.parse(typeof prepared.body === "string" ? prepared.body : prepared.body.toString()) as Record<string, unknown>;
     if (body.tool_choice === "none") return false;
     if (!Array.isArray(body.messages) || !Array.isArray(body.tools)) return false;
     const tool = body.tools.find((t: { type?: string; function?: { name?: string } }) => t?.type === "function" && t.function?.name === "compress") as unknown;
     if (!tool) return false;
+    if (job) {
+        jobs.delete(session);
+        attemptedRequests.add(req);
+        return collect(job, args);
+    }
     const range = archiveChunk(prepared, core, config);
     if (!range) return false;
     const { originals } = range;
@@ -210,13 +386,20 @@ export async function maybeRunBoundedMaintenance(args: {
         log("info", `[${session.id}] [bounded-maintenance] deferred by upstream rate-limit hold`);
         return false;
     }
+    if (admission.probeToken !== undefined) {
+        // Generation now overlaps the request that launched it. Holding the
+        // single probe slot of an expired hold would get that request rejected,
+        // so leave the probe to ordinary traffic and try again on a later turn.
+        releaseUpstreamThrottleProbe(admission.probeToken);
+        log("info", `[${session.id}] [bounded-maintenance] deferred; an expired rate-limit hold is awaiting its probe`);
+        return false;
+    }
     attemptedRequests.add(req);
     session.metadata.boundedMaintenanceAttempt = signature;
     const attempt = retry?.pending && retry.attempts < MAX_MAINTENANCE_ATTEMPTS ? retry.attempts + 1 : 1;
     session.metadata.boundedMaintenanceRetry = { pending: true, attempts: attempt, nextAttemptAt: Date.now() + (attempt === 1 ? 30000 : 60000) } satisfies MaintenanceRetry;
     markDirty(session);
-    const span = `${range.startRef}\u2013${range.endRef}`;
-    const deadline = AbortSignal.any([signal, AbortSignal.timeout(bounded(policy.timeoutMs, 15000, 30000))]);
+    const span = `${range.startRef}–${range.endRef}`;
     const maintenance = { ...body, stream: false, max_tokens: bounded(policy.maxTokens, 1024, 4096), reasoning_effort: "low",
         tools: [tool], tool_choice: { type: "function", function: { name: "compress" } }, parallel_tool_calls: false,
         messages: [
@@ -225,106 +408,31 @@ export async function maybeRunBoundedMaintenance(args: {
         ],
     } as Record<string, unknown>;
     for (const key of ["stream_options", "response_format", "max_completion_tokens"]) delete maintenance[key];
-    const before = new Set(session.state.blocks.map(b => b.blockId));
-    const sourceState = session.state;
-    const sourceRevision = session.revisionEpoch;
-    const started = Date.now();
-    let outcome = "failed";
-    let blockIds: string[] = [];
-    let usage: { inputTokens?: number; outputTokens?: number; reasoningTokens?: number } = {};
-    let stage = "fetch";
-    let failureKind: string | undefined;
-    let errorName: string | undefined;
-    let httpStatus: number | undefined;
-    let headersMs: number | undefined;
-    let responseMs: number | undefined;
-    let returnedModel: string | undefined;
-    let finishReason: string | undefined;
     const payload = JSON.stringify(maintenance);
-    const measurement = {
-        routeId: createHash("sha256").update(new URL(target.upstreamUrl).origin + new URL(target.upstreamUrl).pathname).digest("hex").slice(0, 16),
-        requestedModel: measuredIdentifier(body.model), requestedReasoningEffort: "low", maxOutputTokens: maintenance.max_tokens,
-        sourceBytes: Buffer.byteLength(range.source), sourceMessages: originals.length,
-        startRef: range.startRef, endRef: range.endRef, requestBytes: Buffer.byteLength(payload),
-        attempt, trigger: attempt > 1 ? "retry" : "nudge",
+    const launched: MaintenanceJob = {
+        done: false, startRef: range.startRef, endRef: range.endRef, ids: originals.map(message => message.id),
+        attempt, started: Date.now(), stage: "fetch", usage: {},
+        measurement: {
+            routeId: createHash("sha256").update(new URL(target.upstreamUrl).origin + new URL(target.upstreamUrl).pathname).digest("hex").slice(0, 16),
+            requestedModel: measuredIdentifier(body.model), requestedReasoningEffort: "low", maxOutputTokens: maintenance.max_tokens,
+            sourceBytes: Buffer.byteLength(range.source), sourceMessages: originals.length,
+            startRef: range.startRef, endRef: range.endRef, requestBytes: Buffer.byteLength(payload),
+            attempt, trigger: attempt > 1 ? "retry" : "nudge",
+        },
     };
-    try {
-        const { response, clearTimer } = await fetchWithTimeout(target.upstreamUrl, {
-            method: "POST", headers: { ...target.headers, "content-type": "application/json" },
-            body: payload, dispatcher: proxyDispatcher(target.proxyUrl),
-        }, bounded(policy.timeoutMs, 15000, 30000), deadline);
-        headersMs = Date.now() - started;
-        httpStatus = response.status;
-        stage = "read-response";
-        let json: Record<string, unknown>;
-        const settle429 = response.status === 429
-            ? beginProvisionalUpstreamThrottle429(target.upstreamUrl, target.headers, response.headers.get("retry-after"), Date.now(), model, admission.probeToken)
-            : undefined;
-        if (response.status !== 429) noteUpstreamThrottleResolved(target.upstreamUrl, target.headers, response.status, Date.now(), model, admission.probeToken);
-        try {
-            if (!response.ok) {
-                failureKind = "http";
-                if (settle429) settle429(throttle429ModelScope(response.status, model, await readResponseText(response)));
-                else await response.body?.cancel();
-                throw new Error("maintenance HTTP failure");
-            }
-            json = JSON.parse(await readResponseText(response)) as Record<string, unknown>;
-        } finally { settle429?.(); clearTimer(); }
-        responseMs = Date.now() - started;
-        stage = "validate";
-        if (deadline.aborted) throw new Error("maintenance aborted");
-        returnedModel = measuredIdentifier(json.model);
-        const measured = json.usage as { prompt_tokens?: number; completion_tokens?: number; completion_tokens_details?: { reasoning_tokens?: number } } | undefined;
-        usage = { inputTokens: measured?.prompt_tokens, outputTokens: measured?.completion_tokens, reasoningTokens: measured?.completion_tokens_details?.reasoning_tokens };
-        const choices = json.choices as { finish_reason?: string; message?: { tool_calls?: { id?: string; type?: string; function?: { name?: string; arguments?: string } }[] } }[] | undefined;
-        finishReason = measuredIdentifier(choices?.[0]?.finish_reason);
-        if (choices?.[0]?.finish_reason === "length") throw new Error("truncated maintenance");
-        const calls = choices?.[0]?.message?.tool_calls;
-        if (!Array.isArray(calls) || calls.length !== 1 || calls[0].type !== "function" || calls[0].function?.name !== "compress") throw new Error("expected one compress call");
-        const input = JSON.parse(calls[0].function.arguments ?? "") as { content?: unknown };
-        if (typeof input.content !== "string") throw new Error("invalid compression content");
-        const parsed = parseCompressInput({ content: input.content }, undefined, { quiet: true });
-        if (!parsed.diagnostics.ok || parsed.diagnostics.invalidItems > 0 || parsed.ranges.length !== 1
-            || parsed.ranges[0].startRef !== range.startRef || parsed.ranges[0].endRef !== range.endRef) throw new Error("maintenance range mismatch");
-        if (deadline.aborted || session.state !== sourceState || session.revisionEpoch !== sourceRevision
-            || !exactCoverage(prepared, core, config, originals, range.startRef, range.endRef, parsed.ranges[0].summary, parsed.ranges[0].summaryMaxChars)) throw new Error("maintenance coverage changed");
-        stage = "compress";
-        const result = await executeProxyToolAsync("compress", { content: input.content }, {
-            core, config, session, messages: prepared.processedMessages, archiveMessages: prepared.originalMessages,
-            compressMessages: prepared.originalMessages,
-            log: message => log("info", `[${session.id}] [bounded-maintenance] ${message}`),
-        }, undefined, undefined, deadline);
-        const created = session.state.blocks.filter(b => !before.has(b.blockId));
-        blockIds = created.map(b => b.blockId);
-        const applied = result.outcome === "applied" && created.length > 0;
-        outcome = applied ? "applied" : created.length > 0 ? "partial" : "not-applied";
-        stage = "complete";
-        log(applied ? "info" : "warn", `[${session.id}] [bounded-maintenance] ${outcome}; blocksCreated=${created.length}`);
-        return created.length > 0;
-    } catch (error) {
-        failureKind = signal.aborted ? "client-abort" : deadline.aborted ? "deadline" : failureKind ?? stage;
-        errorName = error instanceof Error ? measuredIdentifier(error.name) : undefined;
-        log("warn", `[${session.id}] [bounded-maintenance] failed; continuing original task without an in-turn retry`);
-        return session.state.blocks.some(b => !before.has(b.blockId));
-    } finally {
-        releaseUpstreamThrottleProbe(admission.probeToken);
-        const blocksCreated = session.state.blocks.filter(b => !before.has(b.blockId)).length;
-        session.metadata.boundedMaintenanceRetry = {
-            pending: blocksCreated === 0 && failureKind !== "client-abort",
-            attempts: attempt, nextAttemptAt: Date.now() + (attempt === 1 ? 30000 : 60000),
-        } satisfies MaintenanceRetry;
-        session.metadata.boundedMaintenanceLast = {
-            durationMs: Date.now() - started,
-            outcome,
-            blocksCreated,
-            blockIds,
-            ...measurement, stage, failureKind, errorName, httpStatus, headersMs, responseMs, returnedModel, finishReason,
-            ...usage,
-        };
-        markDirty(session);
-        log("info", `[${session.id}] [bounded-maintenance] durationMs=${Date.now() - started}`);
-        log("info", `[${session.id}] [bounded-maintenance] measurement=${JSON.stringify(session.metadata.boundedMaintenanceLast)}`);
-    }
+    const controller = new AbortController();
+    const aborts = generationAborts.get(opts) ?? new Set<AbortController>();
+    generationAborts.set(opts, aborts);
+    aborts.add(controller);
+    jobs.set(session, launched);
+    const task: Promise<void> = generate(launched, {
+        url: target.upstreamUrl, headers: target.headers, proxyUrl: target.proxyUrl, payload,
+        timeoutMs: bounded(policy.timeoutMs, 15000, 30000), model, cancel: controller.signal, sessionId: session.id, log,
+    }).catch(() => { launched.done = true; launched.failureKind ??= launched.stage; })
+        .finally(() => { aborts.delete(controller); generating.delete(task); });
+    generating.add(task);
+    log("info", `[${session.id}] [bounded-maintenance] launched off the request path; attempt=${attempt} span=${span}`);
+    return false;
 }
 
 export function withBoundedMaintenanceReceipt(prepared: Prepared): Prepared {

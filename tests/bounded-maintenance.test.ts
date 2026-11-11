@@ -4,6 +4,7 @@ import { once } from "node:events";
 import test, { mock } from "node:test";
 import { defaultConfig } from "acp-kernel";
 import { startServer, _setRequestWatchdogDelayForTest } from "../src/server.js";
+import { _boundedMaintenanceIdleForTest } from "../src/server/bounded-maintenance.js";
 import { loadOptions } from "../src/config.js";
 import { SessionStore, _setStoreForTest } from "../src/persist.js";
 import { _setForTest as setRegistryForTest } from "../src/registry.js";
@@ -22,6 +23,9 @@ async function scenario(enabled: boolean, mode = "success") {
     let maintenanceAborted = 0;
     const maintenanceBodies: Record<string, unknown>[] = [];
     const mains: Record<string, unknown>[] = [];
+    const extra: { shutdownIdleMs?: number } = {};
+    let mainSeen: () => void = () => {};
+    const mainArrived = new Promise<void>(resolve => { mainSeen = resolve; });
     const upstream = http.createServer(async (req, res) => {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(Buffer.from(c));
@@ -34,8 +38,9 @@ async function scenario(enabled: boolean, mode = "success") {
             assert.equal(body.parallel_tool_calls, false);
             assert.equal(body.stream, false);
             if (mode === "http-error") { res.writeHead(503); res.end("UPSTREAM_SECRET"); return; }
-            if (mode === "timeout" || (retryMode && (maintenance === 1 || mode === "retry-cap"))) { return; }
-            if (mode === "watchdog" || mode === "overflow-watchdog") await new Promise(resolve => setTimeout(resolve, mode === "overflow-watchdog" ? 1000 : 180));
+            if (mode === "timeout" || mode === "shutdown" || (retryMode && (maintenance === 1 || mode === "retry-cap"))) { return; }
+            if (mode === "off-path") await mainArrived;
+            if (mode === "watchdog" || mode === "overflow-watchdog") await new Promise(resolve => setTimeout(resolve, 1500));
             res.writeHead(200, { "content-type": "application/json" });
             const span = /exactly (m\d+\u2013m\d+)/.exec(JSON.stringify(body))?.[1];
             assert.ok(span);
@@ -61,6 +66,7 @@ async function scenario(enabled: boolean, mode = "success") {
             }
             res.writeHead(200, { "content-type": "application/json" });
             mains.push(body);
+            if (mains.length === 2) mainSeen();
             res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: "ACK" }, finish_reason: "stop" }], usage: { prompt_tokens: 50000, completion_tokens: 1 } }));
         }
     });
@@ -84,10 +90,16 @@ async function scenario(enabled: boolean, mode = "success") {
         { type: "function", function: { name: "compress", description: "Compress consumed context", parameters: { type: "object", properties: { content: { type: "string" } } } } },
     ];
     const send = async (messages: unknown[]) => {
+        // The request watchdog is far shorter than the maintenance reply
+        // (1500 ms): a request that waited for maintenance would end in 504.
         const watchdogTurn = (mode === "watchdog" || mode === "overflow-watchdog") && messages.length > 1;
-        if (watchdogTurn) _setRequestWatchdogDelayForTest(mode === "overflow-watchdog" ? 400 : 80);
+        if (watchdogTurn) _setRequestWatchdogDelayForTest(700);
         const r = await fetch(`${origin}/bili/http://127.0.0.1:${port}/v1/chat/completions`, { method: "POST", headers, body: JSON.stringify({ model: "maintenance-fixture", max_tokens: 2048, messages, tools: mode === "no-compress-tool" ? tools.slice(0, 1) : tools, tool_choice: mode === "tool-none" ? "none" : "auto", stream: false }) });
-        assert.equal(r.status, watchdogTurn ? 504 : 200); await r.text();
+        // Observed: this overflow fixture ends in the watchdog 504 even with
+        // maintenance disabled (cause not investigated here), so the 504 is not
+        // evidence about maintenance. Every other turn must succeed.
+        assert.equal(r.status, watchdogTurn && mode === "overflow-watchdog" ? 504 : 200); await r.text();
+        if (mode !== "shutdown") await _boundedMaintenanceIdleForTest();
     };
     try {
         const old = "Project CEDAR; owner Nia; budget 4826 credits; deadline 2026-12-23. ARCHIVE-ORIGINAL-ONLY. " + "old scenery ".repeat(1800);
@@ -128,10 +140,9 @@ async function scenario(enabled: boolean, mode = "success") {
         }
         else if (mode === "concurrent") await Promise.all([send(messages), send(messages)]);
         else await send(messages);
-        if (mode === "watchdog" || mode === "overflow-watchdog") {
-            await new Promise(resolve => setTimeout(resolve, mode === "overflow-watchdog" ? 1250 : 250));
+        if (mode === "overflow-watchdog" || mode === "shutdown") {
             const session = getSession(headers["x-bili-plugin-conversation"]);
-            return { maintenance, maintenanceAborted, inFlight: session.inFlight, maintenanceBodies, mains, blocks: session.state.blocks.length, requests: session.stats.requests, receipt: undefined };
+            return { maintenance, maintenanceAborted, inFlight: session.inFlight, maintenanceBodies, mains, blocks: session.state.blocks.length, requests: session.stats.requests, receipt: undefined, extra };
         }
         if (retryMode) {
             assert.equal(maintenance, 1);
@@ -161,10 +172,18 @@ async function scenario(enabled: boolean, mode = "success") {
             }
         }
         await send([...messages, { role: "assistant", content: "ACK" }, { role: "user", content: "continue again" }]);
+        if (mode === "receipt") await send([...messages, { role: "assistant", content: "ACK" }, { role: "user", content: "continue again" }, { role: "assistant", content: "ACK" }, { role: "user", content: "and once more" }]);
         const session = getSession(headers["x-bili-plugin-conversation"]);
-        return { maintenance, maintenanceAborted, inFlight: session.inFlight, maintenanceBodies, mains, blocks: session.state.blocks.length, requests: session.stats.requests, receipt: session.metadata.boundedMaintenanceLast as { blocksCreated?: number; outcome?: string; sourceBytes?: number; requestBytes?: number; requestedModel?: string; returnedModel?: string; requestedReasoningEffort?: string; inputTokens?: number; reasoningTokens?: number; failureKind?: string; httpStatus?: number; stage?: string; headersMs?: number } | undefined };
+        return { maintenance, maintenanceAborted, inFlight: session.inFlight, maintenanceBodies, mains, blocks: session.state.blocks.length, requests: session.stats.requests, receipt: session.metadata.boundedMaintenanceLast as { blocksCreated?: number; outcome?: string; sourceBytes?: number; requestBytes?: number; requestedModel?: string; returnedModel?: string; requestedReasoningEffort?: string; inputTokens?: number; reasoningTokens?: number; failureKind?: string; httpStatus?: number; stage?: string; headersMs?: number } | undefined, extra };
     } finally {
         proxy.closeAllConnections(); await new Promise<void>(r => proxy.close(() => r()));
+        if (mode === "shutdown") {
+            // The fake upstream is still open and never answers, and the
+            // deadline is 15 s: only the server-close abort can end generation.
+            const closed = performance.now();
+            await _boundedMaintenanceIdleForTest();
+            extra.shutdownIdleMs = performance.now() - closed;
+        }
         upstream.closeAllConnections(); await new Promise<void>(r => upstream.close(() => r()));
         clock?.mock.restore();
         _setRequestWatchdogDelayForTest(null);
@@ -212,13 +231,28 @@ test("opt-in runs one verified maintenance turn and forwards folded history with
     const result = await scenario(true);
     assert.equal(result.maintenance, 1);
     assert.equal(result.blocks, 1);
+    assert.equal(result.mains.length, 3);
     assert.equal(result.requests, result.mains.length, "maintenance rebuild does not count as a second incoming request");
     assert.equal(result.receipt?.blocksCreated, 1);
     assert.equal(result.receipt?.outcome, "applied");
-    assert.equal(result.mains[1].tool_choice, "auto");
-    assert.ok(!JSON.stringify(result.mains[1]).includes("ARCHIVE-ORIGINAL-ONLY"));
-    assert.ok(JSON.stringify(result.mains[1]).includes("LATEST-WORK-MUST-STAY"));
-    assert.ok(JSON.stringify(result.mains[1]).includes("CEDAR"));
+    assert.ok(JSON.stringify(result.mains[1]).includes("ARCHIVE-ORIGINAL-ONLY"), "the launching request is forwarded as it arrived");
+    assert.equal(result.mains[2].tool_choice, "auto");
+    assert.ok(!JSON.stringify(result.mains[2]).includes("ARCHIVE-ORIGINAL-ONLY"));
+    assert.ok(JSON.stringify(result.mains[2]).includes("LATEST-WORK-MUST-STAY"));
+    assert.ok(JSON.stringify(result.mains[2]).includes("CEDAR"));
+});
+
+test("maintenance generation runs off the request path and its fold lands on the next request", async () => {
+    // The fake upstream withholds the maintenance reply until the triggering
+    // request's own forward has arrived: only an off-path launch can pass.
+    const result = await scenario(true, "off-path");
+    assert.equal(result.maintenance, 1);
+    assert.equal(result.blocks, 1);
+    assert.ok(JSON.stringify(result.mains[1]).includes("ARCHIVE-ORIGINAL-ONLY"), "the triggering request is forwarded unfolded");
+    assert.ok(!JSON.stringify(result.mains[1]).includes("[bili-maintenance-receipt]"));
+    assert.ok(!JSON.stringify(result.mains[2]).includes("ARCHIVE-ORIGINAL-ONLY"), "the next request carries the fold");
+    assert.ok(JSON.stringify(result.mains[2]).includes("[bili-maintenance-receipt]"));
+    assert.ok(JSON.stringify(result.mains[2]).includes("LATEST-WORK-MUST-STAY"));
 });
 
 test("a newly delivered nudge arms maintenance using current-turn policy", async () => {
@@ -227,20 +261,31 @@ test("a newly delivered nudge arms maintenance using current-turn policy", async
     assert.equal(result.blocks, 1, "the previous unnudged seed turn must not veto the fresh prompted fold");
 });
 
-test("request watchdog cancels maintenance and cannot commit after the 504", async () => {
+test("a maintenance reply slower than the request watchdog no longer fails the request", async () => {
     const result = await scenario(true, "watchdog");
     assert.equal(result.maintenance, 1);
-    assert.equal(result.blocks, 0);
-    assert.equal(result.mains.length, 1, "only the initial seed request reached the ordinary upstream");
+    assert.equal(result.maintenanceAborted, 0, "the request ending does not cancel generation");
+    assert.equal(result.mains.length, 3, "the launching request reached the ordinary upstream instead of ending in 504");
+    assert.ok(JSON.stringify(result.mains[1]).includes("ARCHIVE-ORIGINAL-ONLY"));
+    assert.equal(result.blocks, 1, "the result is committed by the next request");
+    assert.ok(!JSON.stringify(result.mains[2]).includes("ARCHIVE-ORIGINAL-ONLY"));
+    assert.equal(result.inFlight, 0);
 });
 
-test("overflow recovery maintenance remains cancelled by the request watchdog after relay registration", async () => {
+test("maintenance launched during overflow recovery cannot commit after the watchdog 504 and releases ownership", async () => {
     const result = await scenario(true, "overflow-watchdog");
     assert.equal(result.maintenance, 1, "maintenance was skipped initially and first attempted in overflow recovery");
-    assert.equal(result.mains.length, 2, "the initial ordinary request reached the relay and returned overflow");
-    assert.equal(result.blocks, 0, "the delayed maintenance response must not commit after the watchdog 504");
-    assert.equal(result.maintenanceAborted, 1, "the upstream maintenance fetch was actually cancelled");
-    assert.equal(result.inFlight, 0, "request ownership is released instead of waiting for the maintenance deadline");
+    assert.ok(result.mains.length >= 2, "the initial ordinary request reached the relay and returned overflow");
+    assert.equal(result.blocks, 0, "a finished generation is never committed by the request that already ended in 504");
+    assert.equal(result.maintenanceAborted, 0, "generation is independent of the request that launched it");
+    assert.equal(result.inFlight, 0, "request ownership is released without waiting for generation");
+});
+
+test("closing the server cancels a background generation", async () => {
+    const result = await scenario(true, "shutdown");
+    assert.equal(result.maintenance, 1);
+    assert.equal(result.blocks, 0);
+    assert.ok(result.extra.shutdownIdleMs !== undefined && result.extra.shutdownIdleMs < 5000, `generation ended ${result.extra.shutdownIdleMs} ms after close`);
 });
 
 test("default startup never runs hidden maintenance", async () => {
@@ -256,12 +301,14 @@ test("chunked maintenance bounds UTF-8 archive bytes and preserves unselected hi
     assert.ok(Buffer.byteLength(source) <= 32768, `archive bytes ${Buffer.byteLength(source)}`);
     assert.ok(!source.includes("ARCHIVE-UNSELECTED-MUST-STAY"));
     assert.ok(JSON.stringify(result.mains[1]).includes("ARCHIVE-UNSELECTED-MUST-STAY"));
+    assert.ok(JSON.stringify(result.mains[2]).includes("ARCHIVE-UNSELECTED-MUST-STAY"), "the folded request still carries the unselected archive");
     assert.ok(result.blocks >= 1, JSON.stringify(result.receipt));
 });
 
 test("oversized originals are never truncated or falsely claimed by a fold", async () => {
     const result = await scenario(true, "oversized");
     assert.ok(JSON.stringify(result.mains[1]).includes("OVERSIZED-ORIGINAL-MUST-STAY"));
+    assert.ok(JSON.stringify(result.mains[2]).includes("OVERSIZED-ORIGINAL-MUST-STAY"));
     for (const request of result.maintenanceBodies) assert.ok(!JSON.stringify(request).includes("OVERSIZED-ORIGINAL-MUST-STAY"));
 });
 
@@ -297,31 +344,40 @@ test("maintenance reads only eligible originals and leaves protected working con
     assert.equal(result.maintenanceBodies[0].reasoning_effort, "low");
     assert.ok(!JSON.stringify(result.maintenanceBodies[0]).includes("LATEST-WORK-MUST-STAY"));
     assert.ok(JSON.stringify(result.mains[1]).includes("LATEST-WORK-MUST-STAY"));
+    assert.ok(JSON.stringify(result.mains[2]).includes("LATEST-WORK-MUST-STAY"));
 });
 
 test("resumed task receives a factual completion receipt only after a verified new block", async () => {
     const result = await scenario(true, "receipt");
-    const resumed = JSON.stringify(result.mains[1]);
+    assert.ok(!JSON.stringify(result.mains[1]).includes("[bili-maintenance-receipt]"), "no receipt before a block exists");
+    const resumed = JSON.stringify(result.mains[2]);
     assert.ok(resumed.includes("[bili-maintenance-receipt]"));
     assert.ok(resumed.includes("b1"));
-    assert.ok(!JSON.stringify(result.mains[2]).includes("[bili-maintenance-receipt]"));
+    assert.equal(result.mains.length, 4);
+    assert.ok(!JSON.stringify(result.mains[3]).includes("[bili-maintenance-receipt]"), "the receipt is delivered exactly once");
 });
 
 test("malformed maintenance is bounded and leaves originals available to the normal request", async () => {
     const result = await scenario(true, "malformed");
     assert.equal(result.maintenance, 1);
     assert.ok(JSON.stringify(result.mains[1]).includes("ARCHIVE-ORIGINAL-ONLY"));
+    assert.ok(JSON.stringify(result.mains[2]).includes("ARCHIVE-ORIGINAL-ONLY"), "the collecting request keeps the originals too");
+    assert.equal(result.blocks, 0);
 });
 
 for (const mode of ["wrong-tool", "wrong-range", "no-op", "encoded-extra-range", "multiple", "http-error", "timeout", "truncated"]) {
-    test(`${mode} maintenance cannot drop originals or repeat within the turn`, async () => {
+    test(`${mode} maintenance cannot drop originals or repeat on the collecting request`, async () => {
         const result = await scenario(true, mode);
         assert.equal(result.maintenance, 1);
         assert.equal(result.mains.length, 3);
-        assert.equal(result.mains[1].tool_choice, "auto");
-        assert.ok(JSON.stringify(result.mains[1]).includes("ARCHIVE-ORIGINAL-ONLY"));
-        assert.ok(JSON.stringify(result.mains[1]).includes("LATEST-WORK-MUST-STAY"));
-        assert.ok(!JSON.stringify(result.mains[1]).includes("[bili-maintenance-receipt]"));
+        assert.equal(result.blocks, 0);
+        // mains[1] launched the generation; mains[2] collected its failure.
+        for (const main of result.mains.slice(1)) {
+            assert.equal(main.tool_choice, "auto");
+            assert.ok(JSON.stringify(main).includes("ARCHIVE-ORIGINAL-ONLY"));
+            assert.ok(JSON.stringify(main).includes("LATEST-WORK-MUST-STAY"));
+            assert.ok(!JSON.stringify(main).includes("[bili-maintenance-receipt]"));
+        }
     });
 }
 

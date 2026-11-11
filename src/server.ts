@@ -646,7 +646,7 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
 }
 
 export async function startServer(opts: ProxyOptions, runtime?: import("./server/bounded-maintenance.js").ServerRuntimeOptions): Promise<http.Server> {
-    const { configureBoundedMaintenance } = await import("./server/bounded-maintenance.js");
+    const { configureBoundedMaintenance, stopBoundedMaintenance } = await import("./server/bounded-maintenance.js");
     configureBoundedMaintenance(opts, runtime);
     const launchToken = process.env.BILI_LAUNCH_TOKEN?.trim();
     // #1225: lane identity + code fingerprint recorded into the instance file
@@ -793,6 +793,7 @@ export async function startServer(opts: ProxyOptions, runtime?: import("./server
         }
     };
     const server = http.createServer(dispatch);
+    server.once("close", () => stopBoundedMaintenance(opts));
     // Generic WebSocket bridge: protocol codecs claim upgrades here (#1467
     // phase-2 shell); the Responses codec is the first (and currently only)
     // entry. Unclaimed upgrades still fall through to the 426 contract below.
