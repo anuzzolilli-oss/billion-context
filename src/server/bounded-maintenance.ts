@@ -355,11 +355,12 @@ export async function maybeRunBoundedMaintenance(args: {
         || externalSummaryEnabled(config)) return false;
     const job = jobs.get(session);
     if (job && !job.done) return false;
-    const deferredTrigger = deferredTriggers.has(session);
-    if (!job && !freshNudge && !retry?.pending && !deferredTrigger) return false;
+    if (prepared.nudgeOutcome === "vetoed") deferredTriggers.delete(session);
+    const trigger = freshNudge || deferredTriggers.has(session);
+    if (!job && !trigger && !retry?.pending) return false;
     const gate = unpromptedGateOf(session);
     if (gate.requireNudge && (!gate.armed || prepared.nudgeOutcome !== "injected")) return false;
-    if (!job && retry?.pending && (Date.now() < retry.nextAttemptAt || (retry.attempts >= MAX_MAINTENANCE_ATTEMPTS && !freshNudge))) return false;
+    if (!job && retry?.pending && (Date.now() < retry.nextAttemptAt || (retry.attempts >= MAX_MAINTENANCE_ATTEMPTS && !trigger))) return false;
     const body = JSON.parse(typeof prepared.body === "string" ? prepared.body : prepared.body.toString()) as Record<string, unknown>;
     if (body.tool_choice === "none") return false;
     if (!Array.isArray(body.messages) || !Array.isArray(body.tools)) return false;

@@ -495,6 +495,37 @@ for (const hold of ['expired', 'active'] as const) {
     });
 }
 
+for (const hold of ['expired', 'active'] as const) {
+    test(`a fresh trigger deferred by an ${hold} hold can restart an exhausted retry cycle on a later unnudged turn`, async () => {
+        const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+        const exhausted = { pending: true, attempts: 3, nextAttemptAt: 0 };
+        ctx.session.metadata.boundedMaintenanceRetry = exhausted;
+        const unnudged = prepared(ctx, 0, 0); unnudged.nudgeOutcome = 'skipped';
+        assert.equal((await run(ctx, unnudged)).request, undefined, 'control: an exhausted cycle does not restart without a fresh trigger');
+        const deferred = await run(ctx, prepared(ctx, 0, 0), undefined, undefined,
+            { beforeSend: url => noteUpstreamThrottle429(url, {}, '120', hold === 'expired' ? Date.now() - 130000 : Date.now()) });
+        assert.equal(deferred.request, undefined, 'the held turn sends nothing');
+        assert.deepEqual(ctx.session.metadata.boundedMaintenanceRetry, exhausted, 'the deferral leaves the retry state alone');
+        _resetUpstreamThrottleForTest();
+        const later = await run(ctx, unnudged);
+        assert.ok(later.request, 'the deferred fresh trigger restarts the cycle once the hold is gone');
+        assert.equal(later.applied, true);
+    });
+}
+
+test('a deferred trigger does not override a newer model veto', async () => {
+    const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+    const deferred = await run(ctx, prepared(ctx, 0, 0), undefined, undefined,
+        { beforeSend: url => noteUpstreamThrottle429(url, {}, '120', Date.now() - 130000) });
+    assert.equal(deferred.request, undefined, 'the held turn sends nothing');
+    _resetUpstreamThrottleForTest();
+    const vetoed = prepared(ctx, 0, 0); vetoed.nudgeOutcome = 'vetoed';
+    assert.equal((await run(ctx, vetoed)).request, undefined, 'the turn on which the model declined launches nothing');
+    const unnudged = prepared(ctx, 0, 0); unnudged.nudgeOutcome = 'skipped';
+    assert.equal((await run(ctx, unnudged)).request, undefined, 'and the veto spends the deferred trigger');
+    assert.equal(ctx.session.state.blocks.length, 0);
+});
+
 test('control: an unnudged turn with no deferred trigger launches nothing', async () => {
     const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
     const unnudged = prepared(ctx, 0, 0); unnudged.nudgeOutcome = 'skipped';
