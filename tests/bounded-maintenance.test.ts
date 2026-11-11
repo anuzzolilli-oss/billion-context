@@ -16,6 +16,7 @@ let scenarioId = 0;
 
 async function scenario(enabled: boolean, mode = "success") {
     const retryMode = mode.startsWith("retry-");
+    const shutdownMode = mode.startsWith("shutdown");
     let elapsed = 0;
     const baseTime = Date.now();
     const clock = retryMode || mode === "overflow-watchdog" ? mock.method(Date, "now", () => baseTime + elapsed) : undefined;
@@ -23,8 +24,11 @@ async function scenario(enabled: boolean, mode = "success") {
     let maintenanceAborted = 0;
     const maintenanceBodies: Record<string, unknown>[] = [];
     const mains: Record<string, unknown>[] = [];
-    const extra: { shutdownIdleMs?: number } = {};
+    const extra: { shutdownIdleMs?: number; inFlightWhilePending?: number; repliesWhenObserved?: number; launchedWhenObserved?: number } = {};
     let mainSeen: () => void = () => {};
+    let releaseMaintenance: () => void = () => {};
+    const maintenanceBarrier = new Promise<void>(resolve => { releaseMaintenance = resolve; });
+    let maintenanceReplies = 0;
     const mainArrived = new Promise<void>(resolve => { mainSeen = resolve; });
     const upstream = http.createServer(async (req, res) => {
         const chunks: Buffer[] = [];
@@ -38,9 +42,11 @@ async function scenario(enabled: boolean, mode = "success") {
             assert.equal(body.parallel_tool_calls, false);
             assert.equal(body.stream, false);
             if (mode === "http-error") { res.writeHead(503); res.end("UPSTREAM_SECRET"); return; }
-            if (mode === "timeout" || mode === "shutdown" || (retryMode && (maintenance === 1 || mode === "retry-cap"))) { return; }
+            if (mode === "timeout" || shutdownMode || (retryMode && (maintenance === 1 || mode === "retry-cap"))) { return; }
             if (mode === "off-path") await mainArrived;
-            if (mode === "watchdog" || mode === "overflow-watchdog") await new Promise(resolve => setTimeout(resolve, 1500));
+            if (mode === "watchdog") await new Promise(resolve => setTimeout(resolve, 1500));
+            if (mode === "overflow-watchdog") await maintenanceBarrier;
+            maintenanceReplies++;
             res.writeHead(200, { "content-type": "application/json" });
             const span = /exactly (m\d+\u2013m\d+)/.exec(JSON.stringify(body))?.[1];
             assert.ok(span);
@@ -82,6 +88,10 @@ async function scenario(enabled: boolean, mode = "success") {
     };
     const proxy = await startServer(opts, enabled ? { boundedMaintenance: { timeoutMs: mode === "timeout" || retryMode ? 25 : 15000 } } : undefined);
     await once(proxy, "listening");
+    if (mode === "shutdown-relisten") {
+        await new Promise<void>(r => proxy.close(() => r()));
+        proxy.listen(0, "127.0.0.1"); await once(proxy, "listening");
+    }
     const origin = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
     const headers: Record<string, string> = { "content-type": "application/json", "x-bili-plugin": "pi", "x-bili-plugin-conversation": "bounded-" + mode + enabled + "-" + ++scenarioId, "x-bili-plugin-context-window": "64000" };
     if (mode === "wire") { delete headers["x-bili-plugin"]; headers["x-acp-session"] = headers["x-bili-plugin-conversation"]; }
@@ -90,8 +100,8 @@ async function scenario(enabled: boolean, mode = "success") {
         { type: "function", function: { name: "compress", description: "Compress consumed context", parameters: { type: "object", properties: { content: { type: "string" } } } } },
     ];
     const send = async (messages: unknown[]) => {
-        // The request watchdog is far shorter than the maintenance reply
-        // (1500 ms): a request that waited for maintenance would end in 504.
+        // The request watchdog is far shorter than the maintenance reply:
+        // a request that waited for maintenance would end in 504.
         const watchdogTurn = (mode === "watchdog" || mode === "overflow-watchdog") && messages.length > 1;
         if (watchdogTurn) _setRequestWatchdogDelayForTest(700);
         const r = await fetch(`${origin}/bili/http://127.0.0.1:${port}/v1/chat/completions`, { method: "POST", headers, body: JSON.stringify({ model: "maintenance-fixture", max_tokens: 2048, messages, tools: mode === "no-compress-tool" ? tools.slice(0, 1) : tools, tool_choice: mode === "tool-none" ? "none" : "auto", stream: false }) });
@@ -99,7 +109,7 @@ async function scenario(enabled: boolean, mode = "success") {
         // maintenance disabled (cause not investigated here), so the 504 is not
         // evidence about maintenance. Every other turn must succeed.
         assert.equal(r.status, watchdogTurn && mode === "overflow-watchdog" ? 504 : 200); await r.text();
-        if (mode !== "shutdown") await _boundedMaintenanceIdleForTest();
+        if (!shutdownMode && !(watchdogTurn && mode === "overflow-watchdog")) await _boundedMaintenanceIdleForTest();
     };
     try {
         const old = "Project CEDAR; owner Nia; budget 4826 credits; deadline 2026-12-23. ARCHIVE-ORIGINAL-ONLY. " + "old scenery ".repeat(1800);
@@ -140,25 +150,48 @@ async function scenario(enabled: boolean, mode = "success") {
         }
         else if (mode === "concurrent") await Promise.all([send(messages), send(messages)]);
         else await send(messages);
-        if (mode === "overflow-watchdog" || mode === "shutdown") {
+        if (mode === "overflow-watchdog" || shutdownMode) {
             const session = getSession(headers["x-bili-plugin-conversation"]);
+            if (mode === "overflow-watchdog") {
+                // The maintenance reply is held behind the barrier, so
+                // ownership observed here was released while generation was
+                // still pending; a request that kept it would never reach 0.
+                const limit = performance.now() + 5000;
+                while ((maintenance === 0 || session.inFlight > 0) && performance.now() < limit) await new Promise(resolve => setTimeout(resolve, 10));
+                extra.inFlightWhilePending = session.inFlight;
+                extra.repliesWhenObserved = maintenanceReplies;
+                extra.launchedWhenObserved = maintenance;
+                releaseMaintenance();
+                await _boundedMaintenanceIdleForTest();
+            }
             return { maintenance, maintenanceAborted, inFlight: session.inFlight, maintenanceBodies, mains, blocks: session.state.blocks.length, requests: session.stats.requests, receipt: undefined, extra };
         }
         if (retryMode) {
             assert.equal(maintenance, 1);
             assert.equal(getSession(headers["x-bili-plugin-conversation"]).state.blocks.length, 0);
             assert.ok(JSON.stringify(mains.at(-1)).includes("ARCHIVE-ORIGINAL-ONLY"));
+            // Phases are explicit: a request that finds a finished job only
+            // collects it, so each guard is probed by a request sent after
+            // that collection.
+            const retryState = () => getSession(headers["x-bili-plugin-conversation"]).metadata.boundedMaintenanceRetry as { pending: boolean; attempts: number } | undefined;
+            await send(messages);
+            assert.deepEqual([retryState()?.pending, retryState()?.attempts], [true, 1], "the failed first attempt is collected");
             await send(messages);
             assert.equal(maintenance, 1, "No retry during cooldown");
             elapsed += 30001;
             if (mode === "retry-changed") messages[3] = { role: "assistant", content: "CHANGED ARCHIVE " + "replacement facts ".repeat(1300) };
             await Promise.all([send(messages), send(messages)]);
             assert.equal(maintenance, 2, "Exactly one retry after cooldown, even concurrently");
+            await send(messages);
+            assert.equal(maintenance, 2, "collecting the retry launches nothing");
             if (mode === "retry-cap") {
+                assert.deepEqual([retryState()?.pending, retryState()?.attempts], [true, 2], "the failed retry is collected");
                 elapsed += 59999; await send(messages);
                 assert.equal(maintenance, 2, "Second retry has a longer cooldown");
                 elapsed += 2; await send(messages);
                 assert.equal(maintenance, 3);
+                await send(messages);
+                assert.deepEqual([retryState()?.pending, retryState()?.attempts], [true, 3], "the failed last attempt is collected");
                 elapsed += 120000; await send(messages);
                 assert.equal(maintenance, 3, "Exhausted budget cannot retry on every request");
                 messages[3] = { role: "assistant", content: "Changed after exhaustion " + "new archive ".repeat(1500) };
@@ -177,7 +210,7 @@ async function scenario(enabled: boolean, mode = "success") {
         return { maintenance, maintenanceAborted, inFlight: session.inFlight, maintenanceBodies, mains, blocks: session.state.blocks.length, requests: session.stats.requests, receipt: session.metadata.boundedMaintenanceLast as { blocksCreated?: number; outcome?: string; sourceBytes?: number; requestBytes?: number; requestedModel?: string; returnedModel?: string; requestedReasoningEffort?: string; inputTokens?: number; reasoningTokens?: number; failureKind?: string; httpStatus?: number; stage?: string; headersMs?: number } | undefined, extra };
     } finally {
         proxy.closeAllConnections(); await new Promise<void>(r => proxy.close(() => r()));
-        if (mode === "shutdown") {
+        if (shutdownMode) {
             // The fake upstream is still open and never answers, and the
             // deadline is 15 s: only the server-close abort can end generation.
             const closed = performance.now();
@@ -278,11 +311,21 @@ test("maintenance launched during overflow recovery cannot commit after the watc
     assert.ok(result.mains.length >= 2, "the initial ordinary request reached the relay and returned overflow");
     assert.equal(result.blocks, 0, "a finished generation is never committed by the request that already ended in 504");
     assert.equal(result.maintenanceAborted, 0, "generation is independent of the request that launched it");
-    assert.equal(result.inFlight, 0, "request ownership is released without waiting for generation");
+    assert.equal(result.extra.launchedWhenObserved, 1, "generation had been launched when ownership was observed");
+    assert.equal(result.extra.repliesWhenObserved, 0, "and its reply was still withheld");
+    assert.equal(result.extra.inFlightWhilePending, 0, "request ownership is released without waiting for generation");
+    assert.equal(result.inFlight, 0);
 });
 
 test("closing the server cancels a background generation", async () => {
     const result = await scenario(true, "shutdown");
+    assert.equal(result.maintenance, 1);
+    assert.equal(result.blocks, 0);
+    assert.ok(result.extra.shutdownIdleMs !== undefined && result.extra.shutdownIdleMs < 5000, `generation ended ${result.extra.shutdownIdleMs} ms after close`);
+});
+
+test("closing a server that closed and re-listened still cancels a background generation", async () => {
+    const result = await scenario(true, "shutdown-relisten");
     assert.equal(result.maintenance, 1);
     assert.equal(result.blocks, 0);
     assert.ok(result.extra.shutdownIdleMs !== undefined && result.extra.shutdownIdleMs < 5000, `generation ended ${result.extra.shutdownIdleMs} ms after close`);

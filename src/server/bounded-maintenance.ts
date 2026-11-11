@@ -193,6 +193,7 @@ interface MaintenanceJob {
 const jobs = new WeakMap<Prepared["session"], MaintenanceJob>();
 const generating = new Set<Promise<void>>();
 const generationAborts = new WeakMap<ProxyOptions, Set<AbortController>>();
+const deferredTriggers = new WeakSet<Prepared["session"]>();
 
 /** Cancel this server's in-flight background generations (server close). */
 export function stopBoundedMaintenance(opts: ProxyOptions): void {
@@ -354,7 +355,8 @@ export async function maybeRunBoundedMaintenance(args: {
         || externalSummaryEnabled(config)) return false;
     const job = jobs.get(session);
     if (job && !job.done) return false;
-    if (!job && !freshNudge && !retry?.pending) return false;
+    const deferredTrigger = deferredTriggers.has(session);
+    if (!job && !freshNudge && !retry?.pending && !deferredTrigger) return false;
     const gate = unpromptedGateOf(session);
     if (gate.requireNudge && (!gate.armed || prepared.nudgeOutcome !== "injected")) return false;
     if (!job && retry?.pending && (Date.now() < retry.nextAttemptAt || (retry.attempts >= MAX_MAINTENANCE_ATTEMPTS && !freshNudge))) return false;
@@ -369,13 +371,13 @@ export async function maybeRunBoundedMaintenance(args: {
         return collect(job, args);
     }
     const range = archiveChunk(prepared, core, config);
-    if (!range) return false;
+    if (!range) { deferredTriggers.delete(session); return false; }
     const { originals } = range;
     const signature = createHash("sha256").update(JSON.stringify({
         start: range.startRef, end: range.endRef,
         originals,
     })).digest("hex");
-    if (session.metadata.boundedMaintenanceAttempt === signature && !retry?.pending) return false;
+    if (session.metadata.boundedMaintenanceAttempt === signature && !retry?.pending) { deferredTriggers.delete(session); return false; }
     const target = buildForwardTarget(req, opts, resolveUpstream(opts, req.url ?? "", req), undefined, args.hopMarker ?? "bounded-maintenance");
     if (inboundResignCredential(req.headers, opts, target.upstreamUrl) !== undefined) return false;
     const credential = laneCredential(opts.routes, target.upstreamUrl, message => log("warn", message));
@@ -383,6 +385,7 @@ export async function maybeRunBoundedMaintenance(args: {
     const model = typeof body.model === "string" ? body.model : undefined;
     const admission = upstreamThrottleGate(target.upstreamUrl, target.headers, Date.now(), model);
     if (admission.reject !== undefined) {
+        if (freshNudge) deferredTriggers.add(session);
         log("info", `[${session.id}] [bounded-maintenance] deferred by upstream rate-limit hold`);
         return false;
     }
@@ -391,10 +394,12 @@ export async function maybeRunBoundedMaintenance(args: {
         // single probe slot of an expired hold would get that request rejected,
         // so leave the probe to ordinary traffic and try again on a later turn.
         releaseUpstreamThrottleProbe(admission.probeToken);
+        if (freshNudge) deferredTriggers.add(session);
         log("info", `[${session.id}] [bounded-maintenance] deferred; an expired rate-limit hold is awaiting its probe`);
         return false;
     }
     attemptedRequests.add(req);
+    deferredTriggers.delete(session);
     session.metadata.boundedMaintenanceAttempt = signature;
     const attempt = retry?.pending && retry.attempts < MAX_MAINTENANCE_ATTEMPTS ? retry.attempts + 1 : 1;
     session.metadata.boundedMaintenanceRetry = { pending: true, attempts: attempt, nextAttemptAt: Date.now() + (attempt === 1 ? 30000 : 60000) } satisfies MaintenanceRetry;

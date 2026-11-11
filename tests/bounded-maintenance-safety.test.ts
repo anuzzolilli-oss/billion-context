@@ -476,6 +476,32 @@ test('maintenance never takes the probe slot of an expired hold from ordinary tr
     releaseUpstreamThrottleProbe(next.probeToken);
 });
 
+for (const hold of ['expired', 'active'] as const) {
+    test(`a fresh trigger deferred by an ${hold} hold launches on a later unnudged turn without consuming an attempt`, async () => {
+        const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+        const deferred = await run(ctx, prepared(ctx, 0, 0), undefined, undefined,
+            { beforeSend: url => noteUpstreamThrottle429(url, {}, '120', hold === 'expired' ? Date.now() - 130000 : Date.now()) });
+        assert.equal(deferred.request, undefined, 'the held turn sends nothing');
+        const retryState = () => ctx.session.metadata.boundedMaintenanceRetry as { attempts?: number } | undefined;
+        assert.equal(retryState(), undefined, 'the deferral consumes no attempt');
+        _resetUpstreamThrottleForTest();
+        const unnudged = prepared(ctx, 0, 0); unnudged.nudgeOutcome = 'skipped';
+        const later = await run(ctx, unnudged);
+        assert.ok(later.request, 'the deferred trigger launches once the hold is gone');
+        assert.equal(later.applied, true);
+        assert.equal(retryState()?.attempts, 1);
+        const again = await run(ctx, unnudged);
+        assert.equal(again.request, undefined, 'the deferred trigger is spent by its launch');
+    });
+}
+
+test('control: an unnudged turn with no deferred trigger launches nothing', async () => {
+    const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+    const unnudged = prepared(ctx, 0, 0); unnudged.nudgeOutcome = 'skipped';
+    assert.equal((await run(ctx, unnudged)).request, undefined);
+    assert.equal(ctx.session.state.blocks.length, 0);
+});
+
 for (const scope of ['credential', 'other-model', 'same-model'] as const) {
     test(`maintenance honors ${scope} hold scope without widening it`, async () => {
         const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
