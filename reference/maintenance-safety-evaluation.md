@@ -113,7 +113,7 @@ The change moves generation off the request path and leaves the deadline, caps, 
 | --- | --- |
 | Request latency | A qualifying request launches one background call and is forwarded unchanged. It no longer waits for, or fails with, maintenance. |
 | Commit | A later request for the session collects the finished result under the session lock. The background task mutates no session state. |
-| Staleness | The session revision always advances between requests, so collection checks identity: the refs must resolve to the same message ids and the kernel preview must cover exactly those originals. A rewritten source or a range the agent folded meanwhile is discarded as `stale`. |
+| Staleness | The session revision always advances between requests, so collection checks identity: the refs must resolve to the same message ids, the archive projection sent for summarising must be unchanged (message ids leave out tool-call pairing), and the kernel preview must cover exactly those originals. A rewritten source or a range the agent folded meanwhile is discarded as `stale`. |
 | `compress.requireNudge` | A finished result is held until a turn that delivered a nudge; the engine's unprompted gate is not bypassed. |
 | Rate-limit holds | An active hold defers the launch. A launch that would own the probe slot of an expired hold releases it and defers, because it now overlaps ordinary traffic. |
 | Lifetime | Generation is not tied to the launching request. Server close cancels it. An uncollected result is lost on restart; the persisted retry state covers the re-attempt. |

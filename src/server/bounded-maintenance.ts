@@ -79,6 +79,14 @@ function completeUnits(messages: BiliMessage[]): { start: number; end: number; m
     return units;
 }
 
+function archiveEntries(messages: BiliMessage[]) {
+    return messages.map(message => ({ role: message.role, type: message.contentType, tool: message.toolName, toolCallId: message.toolCallId, content: message.text }));
+}
+
+function archiveFingerprint(messages: BiliMessage[]): string {
+    return createHash("sha256").update(JSON.stringify(archiveEntries(messages))).digest("hex");
+}
+
 function exactCoverage(prepared: Prepared, core: CompressionCore, config: Config,
     originals: BiliMessage[], startRef: string, endRef: string, summary: string, summaryMaxChars?: number): boolean {
     try {
@@ -106,7 +114,7 @@ function archiveChunk(prepared: Prepared, core: CompressionCore, config: Config)
         const eligible = prepared.originalMessages.slice(start, end + 1) as BiliMessage[];
         if (eligible.some(message => message.imagePart || message.imageBase64 || message.rawOpenaiContentParts || message.rawOpenaiContent)) return undefined;
         let messages: BiliMessage[] = [];
-        let source: { role: string; type?: string; tool?: string; toolCallId?: string; content?: string }[] = [];
+        let source: ReturnType<typeof archiveEntries> = [];
         let bytes = 2;
         const keep = () => {
             const startRef = messages.length ? prepared.session.state.messageRefs.byRaw[messages[0].id] : undefined;
@@ -127,7 +135,7 @@ function archiveChunk(prepared: Prepared, core: CompressionCore, config: Config)
             const item = units[index];
             if (item.ambiguous || item.start < start || item.end > end) { keep(); continue; }
             const unit = item.messages;
-            const entries = unit.map(message => ({ role: message.role, type: message.contentType, tool: message.toolName, toolCallId: message.toolCallId, content: message.text }));
+            const entries = archiveEntries(unit);
             const entryBytes = Buffer.byteLength(JSON.stringify(entries)) - 2;
             const unsupported = unit.some(message => message.imagePart || message.imageBase64 || message.rawOpenaiContentParts || message.rawOpenaiContent
                 || !prepared.session.state.messageRefs.byRaw[message.id]);
@@ -172,6 +180,7 @@ interface MaintenanceJob {
     startRef: string;
     endRef: string;
     ids: string[];
+    archive: string;
     attempt: number;
     measurement: Record<string, unknown>;
     started: number;
@@ -278,13 +287,16 @@ async function collect(job: MaintenanceJob, args: Parameters<typeof maybeRunBoun
         stage = "validate";
         // The session revision necessarily advances between the launching and
         // the collecting request, so staleness is judged on identity: the same
-        // refs must still resolve to the same content-hash message ids, and the
-        // kernel preview must still cover exactly those originals.
+        // refs must still resolve to the same content-hash message ids, the
+        // archive projection the summary was written from must be unchanged
+        // (ids leave out tool-call pairing), and the kernel preview must
+        // still cover exactly those originals.
         const refs = session.state.messageRefs.byRef;
         const start = prepared.originalMessages.findIndex(message => message.id === refs[job.startRef]);
         const end = prepared.originalMessages.findIndex(message => message.id === refs[job.endRef]);
         const originals = start >= 0 && end >= start ? prepared.originalMessages.slice(start, end + 1) as BiliMessage[] : [];
         if (signal.aborted || originals.length !== job.ids.length || originals.some((message, index) => message.id !== job.ids[index])
+            || archiveFingerprint(originals) !== job.archive
             || !exactCoverage(prepared, core, config, originals, job.startRef, job.endRef, job.summary, job.summaryMaxChars)) {
             failureKind = signal.aborted ? undefined : "stale";
             throw new Error("maintenance coverage changed");
@@ -410,7 +422,7 @@ export async function maybeRunBoundedMaintenance(args: {
     for (const key of ["stream_options", "response_format", "max_completion_tokens"]) delete maintenance[key];
     const payload = JSON.stringify(maintenance);
     const launched: MaintenanceJob = {
-        done: false, startRef: range.startRef, endRef: range.endRef, ids: originals.map(message => message.id),
+        done: false, startRef: range.startRef, endRef: range.endRef, ids: originals.map(message => message.id), archive: archiveFingerprint(originals),
         attempt, started: Date.now(), stage: "fetch", usage: {},
         measurement: {
             routeId: createHash("sha256").update(new URL(target.upstreamUrl).origin + new URL(target.upstreamUrl).pathname).digest("hex").slice(0, 16),
