@@ -7,7 +7,7 @@ import { countMessageTokens, createCore, defaultConfig, assignRefs, emptyRefMap,
 import { createSession } from '../src/session.js';
 import { loadOptions, type ProxyOptions } from '../src/config.js';
 import { SessionStore, _setStoreForTest } from '../src/persist.js';
-import { configureBoundedMaintenance, maybeRunBoundedMaintenance } from '../src/server/bounded-maintenance.js';
+import { _boundedMaintenanceIdleForTest, configureBoundedMaintenance, maybeRunBoundedMaintenance } from '../src/server/bounded-maintenance.js';
 import { startServer, stripKernelSummaries, type Prepared } from '../src/server.js';
 import { executeProxyToolAsync } from '../src/loop/core.js';
 import { storeUnpromptedGate } from '../src/unprompted-gate.js';
@@ -50,7 +50,8 @@ function prepared(ctx: ReturnType<typeof fixture>, startIndex: number, endIndex:
 }
 async function run(ctx: ReturnType<typeof fixture>, p: Prepared, callId = 'hidden-maintenance', beforeReply?: () => void,
     settings: { credential?: boolean; content?: string; incoming?: http.IncomingMessage; chain?: boolean;
-        beforeSend?: (url: string) => void; status?: number; responseBody?: string; transportFailure?: boolean } = {}) {
+        beforeSend?: (url: string) => void; status?: number; responseBody?: string; transportFailure?: boolean;
+        collectWith?: Prepared[] } = {}) {
     let request: MaintenanceRequest | undefined;
     let capturedHeaders: http.IncomingHttpHeaders | undefined;
     const logs: string[] = [];
@@ -83,9 +84,25 @@ async function run(ctx: ReturnType<typeof fixture>, p: Prepared, callId = 'hidde
     incoming.url = `/bili/${target}/v1/chat/completions`;
     try {
         settings.beforeSend?.(`${target}/v1/chat/completions`);
-        const applied = await maybeRunBoundedMaintenance({ prepared: p, req: incoming,
+        // Generation is off the request path: the launching request must
+        // return at once with nothing applied; the finished result is
+        // collected by a later incoming request for the same session.
+        const call = (current: Prepared, req: http.IncomingMessage) => maybeRunBoundedMaintenance({ prepared: current, req,
             opts, core: ctx.core, config: ctx.config, signal: new AbortController().signal, log: (_level, text) => logs.push(text) });
-        return { applied, request, capturedHeaders, logs, receipt: ctx.session.metadata.boundedMaintenanceLast };
+        const blocksBefore = ctx.session.state.blocks.length;
+        const launch = await call(p, incoming);
+        assert.equal(launch, false, 'the launching request never applies maintenance');
+        assert.equal(ctx.session.state.blocks.length, blocksBefore, 'nothing commits while generation is in flight');
+        await _boundedMaintenanceIdleForTest();
+        const collects: boolean[] = [];
+        if (request !== undefined) {
+            for (const current of settings.collectWith ?? [p]) {
+                const later = new http.IncomingMessage(new Socket());
+                later.url = incoming.url;
+                collects.push(await call(current, later));
+            }
+        }
+        return { applied: collects.at(-1) ?? false, collects, request, capturedHeaders, logs, receipt: ctx.session.metadata.boundedMaintenanceLast as { failureKind?: string; outcome?: string; stage?: string } | undefined };
     } finally {
         if (downstream) { downstream.closeAllConnections(); await new Promise<void>(resolve => downstream!.close(() => resolve())); }
         server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
@@ -251,15 +268,60 @@ test('fitting reasoning, tool call and result fold together with full result ret
     assert.ok(restored.text.includes(marker));
 });
 
-test('a changed source revision during generation prevents committing the stale fold', async () => {
+test('a source changed during generation prevents committing the stale fold', async () => {
     const messages = [msg('old', 'Disposable original context '.repeat(400), 'user'), ...tail()];
     const ctx = fixture(messages);
     const result = await run(ctx, prepared(ctx, 0, 0), 'hidden-maintenance', () => {
+        ctx.messages[0] = msg('rewritten', 'Rewritten original context '.repeat(400), 'user');
+    });
+    assert.ok(result.request, 'generation began against the earlier source');
+    assert.equal(result.applied, false);
+    assert.equal(result.receipt?.failureKind, 'stale');
+    assert.equal(ctx.session.state.blocks.length, 0);
+});
+
+test('a range the agent folded during generation is not folded a second time', async () => {
+    const ctx = fixture([msg('old', 'Disposable original context '.repeat(400), 'user'), ...tail()]);
+    const ref = ctx.session.state.messageRefs.byRaw.old;
+    let agentFold: Promise<{ outcome?: string }> | undefined;
+    const result = await run(ctx, prepared(ctx, 0, 0), 'hidden-maintenance', () => {
+        agentFold = executeProxyToolAsync('compress', { content: `${ref}–${ref} Agent archive\n${summary}` }, ctx);
+    });
+    assert.equal((await agentFold)?.outcome, 'applied', 'setup: the agent folded the same range first');
+    assert.equal(result.applied, false);
+    assert.equal(result.receipt?.failureKind, 'stale');
+    assert.equal(ctx.session.state.blocks.length, 1, 'only the agent fold exists');
+});
+
+test('control: a session revision that only advanced between requests does not block the fold', async () => {
+    const ctx = fixture([msg('old', 'Disposable original context '.repeat(400), 'user'), ...tail()]);
+    const result = await run(ctx, prepared(ctx, 0, 0), 'hidden-maintenance', () => {
         ctx.session.revisionEpoch = (ctx.session.revisionEpoch ?? 0) + 1;
     });
-    assert.ok(result.request, 'generation began against the earlier revision');
+    assert.equal(result.applied, true);
+    assert.equal(ctx.session.state.blocks.length, 1);
+});
+
+test('requireNudge holds a finished generation until a turn that delivered a nudge', async () => {
+    const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+    storeUnpromptedGate(ctx.session, { armed: true, requireNudge: true, requireRecommendation: false });
+    const unprompted = prepared(ctx, 0, 0); unprompted.nudgeOutcome = 'skipped';
+    const result = await run(ctx, prepared(ctx, 0, 0), undefined, undefined, { collectWith: [unprompted, prepared(ctx, 0, 0)] });
+    assert.deepEqual(result.collects, [false, true], 'the unprompted turn commits nothing; the prompted turn applies the held result');
+    assert.equal(ctx.session.state.blocks.length, 1);
+});
+
+test('requireRecommendation is judged on the collecting turn: a still-recommended span applies, a withdrawn one does not', async () => {
+    const still = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+    storeUnpromptedGate(still.session, { armed: true, requireNudge: false, requireRecommendation: true });
+    assert.equal((await run(still, prepared(still, 0, 0))).applied, true);
+    assert.equal(still.session.state.blocks.length, 1);
+    const withdrawn = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+    storeUnpromptedGate(withdrawn.session, { armed: true, requireNudge: false, requireRecommendation: true });
+    const result = await run(withdrawn, prepared(withdrawn, 0, 0), undefined, () => { withdrawn.config.preserveRecentMessages = withdrawn.messages.length; });
+    assert.ok(result.request, 'generation ran while the span was still recommended');
     assert.equal(result.applied, false);
-    assert.equal(ctx.session.state.blocks.length, 0);
+    assert.equal(withdrawn.session.state.blocks.length, 0, 'a span no longer offered for folding is not committed');
 });
 
 test('missing advertised endpoint refs cannot fall back to positional indexes', async () => {
@@ -397,30 +459,20 @@ test('malformed maintenance 429 conservatively records an account hold', async (
     assert.ok(upstreamThrottlePeekReject(target, {}, Date.now(), 'other-model'));
 });
 
-test('an expired matching hold admits one maintenance probe and success clears it', async () => {
+test('maintenance never takes the probe slot of an expired hold from ordinary traffic', async () => {
     const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
+    const retry = { pending: true, attempts: 1, nextAttemptAt: 0 };
+    ctx.session.metadata.boundedMaintenanceRetry = retry;
     let target = '';
-    let probeWasOwned = false;
-    const result = await run(ctx, prepared(ctx, 0, 0), undefined, () => {
-        probeWasOwned = upstreamThrottlePeekReject(target, {}, Date.now(), 'local-fixture') !== undefined;
-    }, { beforeSend: url => { target = url; noteUpstreamThrottle429(url, {}, '120', Date.now() - 130000); } });
-    assert.equal(probeWasOwned, true, 'the in-flight maintenance probe owns the slot');
-    assert.equal(result.applied, true);
-    assert.equal(activeThrottleHolds().length, 0);
-});
-
-test('failed maintenance releases its admitted probe without clearing the hold', async () => {
-    const ctx = fixture([msg('old', 'Disposable archive '.repeat(500), 'user'), ...tail()]);
-    let target = '';
-    let probeWasOwned = false;
-    const result = await run(ctx, prepared(ctx, 0, 0), undefined, () => {
-        probeWasOwned = upstreamThrottlePeekReject(target, {}, Date.now(), 'local-fixture') !== undefined;
-    }, { transportFailure: true, beforeSend: url => { target = url; noteUpstreamThrottle429(url, {}, '120', Date.now() - 130000); } });
-    assert.equal(probeWasOwned, true);
+    const result = await run(ctx, prepared(ctx, 0, 0), undefined, undefined,
+        { beforeSend: url => { target = url; noteUpstreamThrottle429(url, {}, '120', Date.now() - 130000); } });
+    assert.equal(result.request, undefined, 'a background call must not own the single probe of an expired hold');
     assert.equal(result.applied, false);
-    assert.ok(activeThrottleHolds().length > 0);
+    assert.deepEqual(ctx.session.metadata.boundedMaintenanceRetry, retry, 'the deferral consumes no attempt');
+    assert.ok(activeThrottleHolds().length > 0, 'the hold is left for ordinary traffic to resolve');
     const next = upstreamThrottleGate(target, {}, Date.now(), 'local-fixture');
-    assert.equal(next.reject, undefined, 'failed probe cannot retain the in-flight slot');
+    assert.equal(next.reject, undefined, 'the overlapping ordinary request is still admitted');
+    assert.ok(next.probeToken, 'and it is the one that probes');
     releaseUpstreamThrottleProbe(next.probeToken);
 });
 
