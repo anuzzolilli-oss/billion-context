@@ -36,7 +36,7 @@ The hub table above is the single ledger — CI checks that `✅` rows have thei
 - **File-level map** (which file does what, one line each): [reference/architecture.md](../reference/architecture.md) — CI enforces it covers every `src/` file.
 - **Construction procedures** (build / test / release / git mechanics): [reference/](../reference/README.md).
 - **Identity doctrine** (the "why" behind identity rules): [message-identity](./message-identity.md) · [session-identity](./session-identity.md) · [identity-channels](./identity-channels.md).
-- **Reader-facing overview** (what the README links): [how-it-works](../how-it-works.en.svg).
+- **Reader-facing overview** (what the README links): [how-it-works](how-it-works.en.svg).
 
 ## Maintenance rules
 
