@@ -280,6 +280,27 @@ test('a source changed during generation prevents committing the stale fold', as
     assert.equal(ctx.session.state.blocks.length, 0);
 });
 
+test('tool results re-paired during generation keep their message ids but prevent committing the stale fold', async () => {
+    const history = (first: string, second: string): CoreMessage[] => [msg('intro', 'Disposable parallel read history '.repeat(350), 'user'),
+        { id: 'call-a', role: 'assistant', contentType: 'tool-call', toolName: 'read_fixture', toolCallId: 'pair-A', text: '{"path":"alpha"}' },
+        { id: 'call-b', role: 'assistant', contentType: 'tool-call', toolName: 'read_fixture', toolCallId: 'pair-B', text: '{"path":"beta"}' },
+        { id: 'result-1', role: 'tool', contentType: 'tool-result', toolName: 'read_fixture', toolCallId: first, text: 'RESULT-ONE' },
+        { id: 'result-2', role: 'tool', contentType: 'tool-result', toolName: 'read_fixture', toolCallId: second, text: 'RESULT-TWO' }, ...tail()];
+    const ctx = fixture(history('pair-A', 'pair-B'));
+    const ids = ctx.messages.map(message => message.id);
+    const result = await run(ctx, prepared(ctx, 0, 4), 'hidden-maintenance', () => {
+        ctx.messages.splice(0, ctx.messages.length, ...history('pair-B', 'pair-A'));
+    });
+    assert.ok(result.request, 'generation began against the earlier pairing');
+    assert.deepEqual(ctx.messages.map(message => message.id), ids, 'setup: only the pairing changed, every message id is the same');
+    assert.equal(result.applied, false);
+    assert.equal(result.receipt?.failureKind, 'stale');
+    assert.equal(ctx.session.state.blocks.length, 0);
+    const unchanged = fixture(history('pair-A', 'pair-B'));
+    assert.equal((await run(unchanged, prepared(unchanged, 0, 4))).applied, true, 'control: the same history with its pairing intact folds');
+    assert.equal(unchanged.session.state.blocks.length, 1);
+});
+
 test('a range the agent folded during generation is not folded a second time', async () => {
     const ctx = fixture([msg('old', 'Disposable original context '.repeat(400), 'user'), ...tail()]);
     const ref = ctx.session.state.messageRefs.byRaw.old;
