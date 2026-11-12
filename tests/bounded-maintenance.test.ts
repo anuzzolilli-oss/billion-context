@@ -172,7 +172,7 @@ async function scenario(enabled: boolean, mode = "success") {
                 // ownership observed here was released while generation was
                 // still pending; a request that kept it would never reach 0.
                 const limit = performance.now() + 5000;
-                while ((maintenance === 0 || session.inFlight > 0) && performance.now() < limit) await new Promise(resolve => setTimeout(resolve, 10));
+                while (((enabled && maintenance === 0) || session.inFlight > 0) && performance.now() < limit) await new Promise(resolve => setTimeout(resolve, 10));
                 extra.inFlightWhilePending = session.inFlight;
                 extra.repliesWhenObserved = maintenanceReplies;
                 extra.launchedWhenObserved = maintenance;
@@ -335,6 +335,15 @@ test("maintenance launched during overflow recovery cannot commit after the watc
     assert.equal(result.extra.launchedWhenObserved, 1, "generation had been launched when ownership was observed");
     assert.equal(result.extra.repliesWhenObserved, 0, "and its reply was still withheld");
     assert.equal(result.extra.inFlightWhilePending, 0, "request ownership is released without waiting for generation");
+    assert.equal(result.inFlight, 0);
+});
+
+test("the withheld recovery summary ends the request in 504 with maintenance disabled too", async () => {
+    const result = await scenario(false, "overflow-watchdog");
+    assert.equal(result.maintenance, 0, "no maintenance call exists to explain the 504");
+    assert.equal(result.extra.recoverySummaries, 1);
+    assert.equal(result.mains.length, 2);
+    assert.equal(result.blocks, 0);
     assert.equal(result.inFlight, 0);
 });
 
