@@ -793,7 +793,7 @@ export async function startServer(opts: ProxyOptions, runtime?: import("./server
         }
     };
     const server = http.createServer(dispatch);
-    server.once("close", () => stopBoundedMaintenance(opts));
+    server.on("close", () => stopBoundedMaintenance(opts));
     // Generic WebSocket bridge: protocol codecs claim upgrades here (#1467
     // phase-2 shell); the Responses codec is the first (and currently only)
     // entry. Unclaimed upgrades still fall through to the 426 contract below.
