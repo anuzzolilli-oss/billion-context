@@ -15,6 +15,8 @@ information.
 | [release.md](release.md) | Release workflow internals, one-click fast path, bugfix channel, updater no-op protocol |
 | [testing.md](testing.md) | Local testing, install, and E2E regression recipes |
 | [ref-keyed-surfaces.md](ref-keyed-surfaces.md) | Ref-keyed surfaces — every surface keyed by a kernel ref number (mNNNNN/bNNNNN): the #5861 ledger. Read before adding any ref-keyed lookup/endpoint |
-| [external-summary.md](external-summary.md) | External summary (compact overview for external agents) |
+| [external-summary.md](external-summary.md) / [中文](external-summary.zh-CN.md) | External summary (compact overview for external agents) |
 | [request-body-budget.md](request-body-budget.md) | Request-body budget & overflow policy (5 GiB default, per-client overrides, overflow diagnostics) |
+| [maintenance-safety-evaluation.md](maintenance-safety-evaluation.md) | Bounded maintenance safety evaluation: review findings, fixes and the off-request-path generation record |
+| [eph02-evaluation.md](eph02-evaluation.md) | eph02 proxy evaluation: the native compression-carrier checker correction and its verification |
 | [cindy-project.md](cindy-project.md) / [中文](cindy-project.zh-CN.md) | Cindy fork setup, project instructions, complete local test recipe and live-proxy operating workflow |

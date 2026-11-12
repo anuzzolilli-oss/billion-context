@@ -36,7 +36,7 @@
 - **文件级地图**（哪个文件干什么，一行一个）：[reference/architecture.md](../reference/architecture.md)——CI 强制它覆盖全部 `src/` 文件。
 - **施工流程**（构建 / 测试 / 发版 / git 机制）：[reference/](../reference/README.md)。
 - **身份教义**（身份规则背后的 why）：[message-identity](./message-identity.zh-CN.md) · [session-identity](./session-identity.zh-CN.md) · [identity-channels](./identity-channels.zh-CN.md)。
-- **面向读者的总览**（README 里那张）：[how-it-works](../how-it-works.zh-CN.svg)。
+- **面向读者的总览**（README 里那张）：[how-it-works](how-it-works.zh-CN.svg)。
 
 ## 维护规则
 
