@@ -7,9 +7,7 @@ on:
   # matrix, master by ci.yml core runs + the gated scheduled full runs.
   pull_request:
     types: [opened, synchronize, reopened, labeled]
-  schedule:
-    - cron: '10/30 * * * *'
-    # three-layer CI: 30-min smart cron — gate skips when master HEAD is unchanged since the last green scheduled run
+  # Fork: the schedule trigger is removed here; dispatch manually to verify master.
   workflow_dispatch:
 
 concurrency:

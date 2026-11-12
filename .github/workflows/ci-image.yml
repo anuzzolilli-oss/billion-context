@@ -19,9 +19,7 @@ on:
       # a kernel change IS a pipeline change (#1289-class guard; #2092).
       - "kernel/**"
       - "package-lock.json"
-  schedule:
-    - cron: '15/30 * * * *'
-    # three-layer CI: 30-min smart cron — gate skips when master HEAD is unchanged since the last green scheduled run
+  # Fork: the schedule trigger is removed here; dispatch manually to verify master.
   workflow_dispatch:
 
 concurrency:

@@ -4,9 +4,7 @@ on:
   # #2637 plan #3: nightly full regression on master — the daily backstop for
   # the path-filtered PR trigger below (schedule ignores paths, so this run
   # covers everything regardless of diff).
-  schedule:
-    - cron: '4/30 * * * *'
-    # three-layer CI: 30-min smart cron — gate skips when master HEAD is unchanged since the last green scheduled run
+  # Fork: the schedule trigger is removed here; dispatch manually to verify master.
   workflow_dispatch:
     inputs:
       forge:

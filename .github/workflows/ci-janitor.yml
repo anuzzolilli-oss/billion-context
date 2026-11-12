@@ -23,10 +23,7 @@ name: CI Run Janitor
 # workflow warning instead of being reaped.
 
 on:
-  schedule:
-    # hourly at :57 — just ahead of the :03/:33 CI crons so a sweep clears
-    # the queue before the next scheduled burst lands
-    - cron: '57 * * * *'
+  # Fork: the schedule trigger is removed here; dispatch manually to verify master.
   workflow_dispatch:
     inputs:
       queuedMaxMinutes:
