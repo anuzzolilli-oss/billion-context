@@ -10,9 +10,7 @@ on:
     types: [opened, synchronize, reopened, labeled]
     branches: [master, agent-relay]  # #3468: agent PRs target the relay branch
   # three-layer CI: master signal comes from ci.yml core runs + gated scheduled full runs
-  schedule:
-    - cron: '13/30 * * * *'
-    # three-layer CI: 30-min smart cron — gate skips when master HEAD is unchanged since the last green scheduled run
+  # Fork: the schedule trigger is removed here; dispatch manually to verify master.
   workflow_dispatch: {}
 
 concurrency:

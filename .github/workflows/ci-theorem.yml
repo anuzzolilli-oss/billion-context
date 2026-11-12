@@ -32,9 +32,7 @@ on:
       - "kernel/src/ccr.ts"
       - ".github/workflows/ci-theorem.yml"
   # three-layer CI: master signal comes from ci.yml core runs + gated scheduled full runs
-  schedule:
-    - cron: '16/30 * * * *'
-    # three-layer CI: 30-min smart cron — gate skips when master HEAD is unchanged since the last green scheduled run
+  # Fork: the schedule trigger is removed here; dispatch manually to verify master.
   workflow_dispatch:
 
 # 2026-10-31 queue-starvation incident: same house pattern as ci-e2e (#3331/#3772)

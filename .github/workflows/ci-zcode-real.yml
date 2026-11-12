@@ -19,9 +19,7 @@ on:
   # '3.14.4' default when no dispatch input is present). pull_request feeds
   # the ci:full label gate + the paths filter only; NO push trigger by design
   # — master's signal is ci.yml core runs + these gated scheduled runs.
-  schedule:
-    - cron: '14/30 * * * *'
-    # three-layer CI: 30-min smart cron — gate skips when master HEAD is unchanged since the last green scheduled run
+  # Fork: the schedule trigger is removed here; dispatch manually to verify master.
   workflow_dispatch:
     inputs:
       zcode_version:

@@ -45,8 +45,7 @@ on:
   # since the last green scheduled run; only then does the FULL matrix run.
   # Lane workflows (e2e/registry/image/theorem/zcode) follow the same gated
   # cron pattern on their own offsets.
-  schedule:
-    - cron: '3/30 * * * *'   # :03/:33 — a few seconds ahead of the lanes (:04+)
+  # Fork: the schedule trigger is removed here; dispatch manually to verify master.
   # One-click release fallback: GitHub suppresses push-event delivery for
   # ref updates made with GITHUB_TOKEN, so the push trigger above never fires
   # on one-click fallback branches (#1744). release-manual.yml compensates by
