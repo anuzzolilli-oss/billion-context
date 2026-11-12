@@ -17,14 +17,17 @@ let scenarioId = 0;
 async function scenario(enabled: boolean, mode = "success") {
     const retryMode = mode.startsWith("retry-");
     const shutdownMode = mode.startsWith("shutdown");
+    const overflowMode = mode.startsWith("overflow-");
     let elapsed = 0;
     const baseTime = Date.now();
-    const clock = retryMode || mode === "overflow-watchdog" ? mock.method(Date, "now", () => baseTime + elapsed) : undefined;
+    const clock = retryMode || overflowMode ? mock.method(Date, "now", () => baseTime + elapsed) : undefined;
     let maintenance = 0;
     let maintenanceAborted = 0;
     const maintenanceBodies: Record<string, unknown>[] = [];
     const mains: Record<string, unknown>[] = [];
-    const extra: { shutdownIdleMs?: number; inFlightWhilePending?: number; repliesWhenObserved?: number; launchedWhenObserved?: number } = {};
+    const extra: { shutdownIdleMs?: number; inFlightWhilePending?: number; repliesWhenObserved?: number; launchedWhenObserved?: number; recoverySummaries?: number; blocksAfterRecovery?: number } = {};
+    let recoverySummaries = 0;
+    let maintenanceHeld = overflowMode;
     let mainSeen: () => void = () => {};
     let releaseMaintenance: () => void = () => {};
     const maintenanceBarrier = new Promise<void>(resolve => { releaseMaintenance = resolve; });
@@ -45,7 +48,7 @@ async function scenario(enabled: boolean, mode = "success") {
             if (mode === "timeout" || shutdownMode || (retryMode && (maintenance === 1 || mode === "retry-cap"))) { return; }
             if (mode === "off-path") await mainArrived;
             if (mode === "watchdog") await new Promise(resolve => setTimeout(resolve, 1500));
-            if (mode === "overflow-watchdog") await maintenanceBarrier;
+            if (overflowMode) await maintenanceBarrier;
             maintenanceReplies++;
             res.writeHead(200, { "content-type": "application/json" });
             const span = /exactly (m\d+\u2013m\d+)/.exec(JSON.stringify(body))?.[1];
@@ -63,11 +66,22 @@ async function scenario(enabled: boolean, mode = "success") {
             }
             res.end(JSON.stringify({ model: "measured-fixture", usage: { prompt_tokens: 8123, completion_tokens: 201, completion_tokens_details: { reasoning_tokens: 17 } }, choices: [{ message, finish_reason: mode === "truncated" ? "length" : "tool_calls" }] }));
         } else {
-            if (mode === "overflow-watchdog" && mains.length === 1) {
+            if (overflowMode && mains.length === 1) {
                 mains.push(body);
                 elapsed += 30001;
                 res.writeHead(400, { "content-type": "application/json" });
                 res.end(JSON.stringify({ error: { code: "context_length_exceeded", message: "This model's maximum context length is 32000 tokens. However, you requested 50000 tokens." } }));
+                return;
+            }
+            // The first ordinary call after the overflow reply is the
+            // request's own recovery asking for a summary. One scenario never
+            // answers it, so the request watchdog fires while recovery waits;
+            // the other answers it, so recovery completes.
+            if (overflowMode && mains.length === 2 && recoverySummaries === 0) {
+                recoverySummaries++;
+                if (mode === "overflow-watchdog") return;
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: "Project CEDAR; owner Nia; budget 4826 credits; deadline 2026-12-23. The earlier turns were filler exchanged between user and assistant; no further decisions, files or errors were recorded. ".repeat(3) }, finish_reason: "stop" }], usage: { prompt_tokens: 9000, completion_tokens: 120 } }));
                 return;
             }
             res.writeHead(200, { "content-type": "application/json" });
@@ -105,18 +119,18 @@ async function scenario(enabled: boolean, mode = "success") {
         const watchdogTurn = (mode === "watchdog" || mode === "overflow-watchdog") && messages.length > 1;
         if (watchdogTurn) _setRequestWatchdogDelayForTest(700);
         const r = await fetch(`${origin}/bili/http://127.0.0.1:${port}/v1/chat/completions`, { method: "POST", headers, body: JSON.stringify({ model: "maintenance-fixture", max_tokens: 2048, messages, tools: mode === "no-compress-tool" ? tools.slice(0, 1) : tools, tool_choice: mode === "tool-none" ? "none" : "auto", stream: false }) });
-        // Observed: this overflow fixture ends in the watchdog 504 even with
-        // maintenance disabled (cause not investigated here), so the 504 is not
-        // evidence about maintenance. Every other turn must succeed.
+        // The overflow-watchdog 504 comes from the withheld recovery summary,
+        // with or without maintenance (#35), so it is not evidence about
+        // maintenance. Every other turn must succeed.
         assert.equal(r.status, watchdogTurn && mode === "overflow-watchdog" ? 504 : 200); await r.text();
-        if (!shutdownMode && !(watchdogTurn && mode === "overflow-watchdog")) await _boundedMaintenanceIdleForTest();
+        if (!shutdownMode && !maintenanceHeld) await _boundedMaintenanceIdleForTest();
     };
     try {
         const old = "Project CEDAR; owner Nia; budget 4826 credits; deadline 2026-12-23. ARCHIVE-ORIGINAL-ONLY. " + "old scenery ".repeat(1800);
         const toolFirst = mode === "tool-first";
         const seed = toolFirst ? [{ role: "assistant", content: null, tool_calls: [{ id: "first-read", type: "function", function: { name: "read_fixture", arguments: "{}" } }] }, { role: "tool", tool_call_id: "first-read", content: old }, { role: "user", content: "inspect fixture" }] : [{ role: "user", content: "hello" }];
         await send(seed);
-        if (mode === "overflow-watchdog") getSession(headers["x-bili-plugin-conversation"]).metadata.boundedMaintenanceRetry = { pending: true, attempts: 1, nextAttemptAt: baseTime + 30000 };
+        if (overflowMode) getSession(headers["x-bili-plugin-conversation"]).metadata.boundedMaintenanceRetry = { pending: true, attempts: 1, nextAttemptAt: baseTime + 30000 };
         const messages: unknown[] = toolFirst ? [...seed, { role: "assistant", content: "ACK" }] : [{ role: "user", content: "hello" }, { role: "assistant", content: "ACK" }, { role: "user", content: "inspect fixture" }, { role: "assistant", content: old }];
         for (let i = 0; i < 12; i++) messages.push({ role: "user", content: mode === "chunked" ? "漢字🙂".repeat(350) : "u".repeat(1000) }, { role: "assistant", content: "a".repeat(1000) });
         if (mode === "chunked") messages.push({ role: "assistant", content: "ARCHIVE-UNSELECTED-MUST-STAY " + "later archive ".repeat(2000) });
@@ -150,19 +164,25 @@ async function scenario(enabled: boolean, mode = "success") {
         }
         else if (mode === "concurrent") await Promise.all([send(messages), send(messages)]);
         else await send(messages);
-        if (mode === "overflow-watchdog" || shutdownMode) {
+        if (overflowMode || shutdownMode) {
             const session = getSession(headers["x-bili-plugin-conversation"]);
-            if (mode === "overflow-watchdog") {
+            extra.recoverySummaries = recoverySummaries;
+            if (overflowMode) {
                 // The maintenance reply is held behind the barrier, so
                 // ownership observed here was released while generation was
                 // still pending; a request that kept it would never reach 0.
                 const limit = performance.now() + 5000;
-                while ((maintenance === 0 || session.inFlight > 0) && performance.now() < limit) await new Promise(resolve => setTimeout(resolve, 10));
+                while (((enabled && maintenance === 0) || session.inFlight > 0) && performance.now() < limit) await new Promise(resolve => setTimeout(resolve, 10));
                 extra.inFlightWhilePending = session.inFlight;
                 extra.repliesWhenObserved = maintenanceReplies;
                 extra.launchedWhenObserved = maintenance;
+                extra.blocksAfterRecovery = session.state.blocks.length;
+                maintenanceHeld = false;
                 releaseMaintenance();
                 await _boundedMaintenanceIdleForTest();
+                // The generation finished after recovery had already folded
+                // its span; the next request collects it.
+                if (mode === "overflow-recovers") await send([...messages, { role: "assistant", content: "ACK" }, { role: "user", content: "continue again" }]);
             }
             return { maintenance, maintenanceAborted, inFlight: session.inFlight, maintenanceBodies, mains, blocks: session.state.blocks.length, requests: session.stats.requests, receipt: undefined, extra };
         }
@@ -308,12 +328,37 @@ test("a maintenance reply slower than the request watchdog no longer fails the r
 test("maintenance launched during overflow recovery cannot commit after the watchdog 504 and releases ownership", async () => {
     const result = await scenario(true, "overflow-watchdog");
     assert.equal(result.maintenance, 1, "maintenance was skipped initially and first attempted in overflow recovery");
-    assert.ok(result.mains.length >= 2, "the initial ordinary request reached the relay and returned overflow");
+    assert.equal(result.mains.length, 2, "the request reached the relay, returned overflow and was not forwarded again");
+    assert.equal(result.extra.recoverySummaries, 1, "recovery was entered: it asked the upstream for a summary, which was withheld");
     assert.equal(result.blocks, 0, "a finished generation is never committed by the request that already ended in 504");
     assert.equal(result.maintenanceAborted, 0, "generation is independent of the request that launched it");
     assert.equal(result.extra.launchedWhenObserved, 1, "generation had been launched when ownership was observed");
     assert.equal(result.extra.repliesWhenObserved, 0, "and its reply was still withheld");
     assert.equal(result.extra.inFlightWhilePending, 0, "request ownership is released without waiting for generation");
+    assert.equal(result.inFlight, 0);
+});
+
+test("the withheld recovery summary ends the request in 504 with maintenance disabled too", async () => {
+    const result = await scenario(false, "overflow-watchdog");
+    assert.equal(result.maintenance, 0, "no maintenance call exists to explain the 504");
+    assert.equal(result.extra.recoverySummaries, 1);
+    assert.equal(result.mains.length, 2);
+    assert.equal(result.blocks, 0);
+    assert.equal(result.inFlight, 0);
+});
+
+test("overflow recovery completes while a maintenance generation is pending, and the late result adds no second fold", async () => {
+    const result = await scenario(true, "overflow-recovers");
+    assert.equal(result.extra.recoverySummaries, 1, "recovery asked the upstream for a summary");
+    assert.equal(result.extra.launchedWhenObserved, 1, "maintenance had been launched by the same request");
+    assert.equal(result.extra.repliesWhenObserved, 0, "and its reply was still withheld when the request returned 200");
+    assert.equal(result.extra.blocksAfterRecovery, 1, "recovery committed its own fold without waiting for maintenance");
+    assert.equal(result.mains.length, 4, "seed, overflowed forward, accepted re-forward and the collecting request");
+    assert.ok(JSON.stringify(result.mains[1]).includes("ARCHIVE-ORIGINAL-ONLY"));
+    assert.ok(!JSON.stringify(result.mains[2]).includes("ARCHIVE-ORIGINAL-ONLY"), "the re-forward carried the recovery fold");
+    assert.equal(result.maintenance, 1, "collecting the late result launches nothing");
+    assert.equal(result.blocks, 1, "the late maintenance result for the already-folded span adds no second block");
+    assert.equal(result.maintenanceAborted, 0);
     assert.equal(result.inFlight, 0);
 });
 
