@@ -135,6 +135,24 @@ async function register(rig: Rig, conversationId: string, opts?: { agent?: strin
     assert.equal(res.status, 200, "register accepted");
 }
 
+// Environment for an MCP shell that a BILI_CONVERSATION_ID host spawns.
+// src/mcp.ts prefers CLAUDE_CODE_SESSION_ID over BILI_CONVERSATION_ID, so one
+// inherited from whatever started the suite (every Claude Code session exports
+// it) would replace the conversation id the test sets (#41). The inherited
+// value is dropped; a test that wants the variable passes it in `extra`.
+const INHERITED_HOST_SESSION = "inherited-host-session-not-registered";
+function mcpShellEnv(parent: NodeJS.ProcessEnv, extra: Record<string, string>): NodeJS.ProcessEnv {
+    const kept = Object.entries(parent).filter(([name]) => name.toUpperCase() !== "CLAUDE_CODE_SESSION_ID");
+    return { ...Object.fromEntries(kept), ...extra };
+}
+
+test("mcp shell env: an inherited CLAUDE_CODE_SESSION_ID is dropped, an explicit one is kept", () => {
+    const dropped = mcpShellEnv({ CLAUDE_CODE_SESSION_ID: INHERITED_HOST_SESSION, Claude_Code_Session_Id: "other-case", PATH: "p" }, { BILI_CONVERSATION_ID: "c" });
+    assert.deepEqual(dropped, { PATH: "p", BILI_CONVERSATION_ID: "c" }, "inherited id removed in any case; everything else passes through");
+    const explicit = mcpShellEnv({ CLAUDE_CODE_SESSION_ID: INHERITED_HOST_SESSION, PATH: "p" }, { CLAUDE_CODE_SESSION_ID: "wanted" });
+    assert.deepEqual(explicit, { PATH: "p", CLAUDE_CODE_SESSION_ID: "wanted" }, "a test can still give the shell a session id");
+});
+
 test("launcher register endpoint: validates body and echoes the registration", async () => {
     const rig = await startRig();
     try {
@@ -328,11 +346,12 @@ test("mcp stdio shell: manifest → tools/list → tools/call forwards to the pl
     await postModel(rig, "mcp-shell-conv");
 
     const shell = spawn(process.execPath, ["--import", "tsx", "src/mcp.ts"], {
-        env: {
-            ...process.env,
+        // The parent env always carries a host session id here, so the test
+        // covers the inherited case wherever the suite is started (#41).
+        env: mcpShellEnv({ ...process.env, CLAUDE_CODE_SESSION_ID: INHERITED_HOST_SESSION }, {
             BILI_MCP_PROXY: rig.proxyUrl(""),
             BILI_CONVERSATION_ID: "mcp-shell-conv",
-        },
+        }),
         stdio: ["pipe", "pipe", "pipe"],
     });
     const { promise: settled, resolve: settledOk, reject: settledErr } = Promise.withResolvers<void>();
@@ -387,12 +406,12 @@ test("mcp stdio shell (codex style): BILI_CONVERSATION_ID self-register → head
     let status: { ok: boolean; pluginAgent?: string } = { ok: false };
 
     const shell = spawn(process.execPath, ["--import", "tsx", "src/mcp.ts"], {
-        env: {
-            ...process.env,
+        // deliberately NO CLAUDE_CODE_SESSION_ID — codex passes none, so an
+        // inherited one is dropped (#41).
+        env: mcpShellEnv({ ...process.env, CLAUDE_CODE_SESSION_ID: INHERITED_HOST_SESSION }, {
             BILI_MCP_PROXY: rig.proxyUrl(""),
             BILI_CONVERSATION_ID: conv,
-            // deliberately NO CLAUDE_CODE_SESSION_ID — codex passes none.
-        },
+        }),
         stdio: ["pipe", "pipe", "pipe"],
     });
     const { promise: settled, resolve: settledOk, reject: settledErr } = Promise.withResolvers<void>();
