@@ -75,14 +75,32 @@ function runRunner(dir: string): Promise<{ code: number | null; out: string; run
         let out = "";
         child.stdout.on("data", (d) => (out += d.toString()));
         child.stderr.on("data", (d) => (out += d.toString()));
+        // Settles once, and only after the child has closed: the caller's
+        // teardown deletes the fixture directory, so nothing may read it
+        // after this promise settles.
+        let timedOut = false;
+        let spawnError: Error | undefined;
         const deadline = setTimeout(() => {
+            timedOut = true;
             child.kill();
-            reject(new Error(`runner copy did not finish in 120s. Output so far:\n${out}`));
         }, 120_000);
-        child.on("error", reject);
+        child.on("error", (e) => {
+            spawnError = e;
+            // A failed spawn emits no 'close'.
+            if (child.pid === undefined) {
+                clearTimeout(deadline);
+                reject(e);
+            }
+        });
         child.on("close", (code) => {
             clearTimeout(deadline);
-            resolve({ code, out, runs: JSON.parse(readFileSync(join(dir, "plan.json"), "utf8")).runs });
+            if (spawnError) return reject(spawnError);
+            if (timedOut) return reject(new Error(`runner copy did not finish in 120s. Output so far:\n${out}`));
+            try {
+                resolve({ code, out, runs: JSON.parse(readFileSync(join(dir, "plan.json"), "utf8")).runs });
+            } catch (e) {
+                reject(e);
+            }
         });
     });
 }

@@ -170,8 +170,17 @@ export function runWatched(command, args, opts = {}) {
         const child = spawn(command, args, { cwd, env, detached: posix });
         // A group leader no longer receives the terminal's or the CI agent's
         // signal with us: pass it on, then end the way the signal would have.
+        // Best-effort snapshot first: a descendant that started its own group
+        // (a nested watch) is outside ours and is only reachable by pid. If the
+        // snapshot fails, the group kill still runs.
         const onSignal = (sig) => {
-            killTree(child.pid, []);
+            let known = [];
+            try {
+                known = descendantsOf(child.pid, list());
+            } catch {
+                known = [];
+            }
+            killTree(child.pid, known);
             process.exit(sig === "SIGINT" ? 130 : 143);
         };
         if (posix) {
