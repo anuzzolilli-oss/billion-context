@@ -133,10 +133,10 @@ function modelBody(stream: boolean): string {
     return JSON.stringify({ model: "i411-model", max_tokens: 8192, stream, messages: [{ role: "user", content: "hello" }] });
 }
 
-async function waitFor(cond: () => boolean, ms = 3000): Promise<void> {
+async function waitFor(cond: () => boolean, what: string, ms = 3000): Promise<void> {
     const t0 = Date.now();
     while (!cond()) {
-        if (Date.now() - t0 > ms) throw new Error("condition not met within timeout");
+        if (Date.now() - t0 > ms) throw new Error(`condition not met within timeout: ${what}`);
         await new Promise((r) => setTimeout(r, 25));
     }
 }
@@ -154,12 +154,12 @@ test("#411 plugin stream: client abort keeps sniffed usage, logs info (not error
         await reader.read();
         await reader.read();
         ac.abort();
-        await waitFor(() => listSessions().some((s) => s.stats.lastInputTokens === 1234));
-        await waitFor(() => _liveUpstreamTimersForTest() === 0);
+        await waitFor(() => listSessions().some((s) => s.stats.lastInputTokens === 1234), "sniffed usage recorded (1234 input tokens)");
+        await waitFor(() => _liveUpstreamTimersForTest() === 0, "live upstream timers back to 0");
         // #2305 review: the info abort log is a SEPARATE async side effect
         // that can land after the timer clears — waiting avoids the
         // synchronous-assert flake seen on a loaded windows-latest runner.
-        await waitFor(() => captured.some((l) => l.level === "info" && l.msg.includes("client aborted mid-stream")));
+        await waitFor(() => captured.some((l) => l.level === "info" && l.msg.includes("client aborted mid-stream")), "info log 'client aborted mid-stream'");
         assert.ok(captured.some((l) => l.level === "info" && l.msg.includes("client aborted mid-stream")), `expected info abort log, got: ${JSON.stringify(captured)}`);
         assert.ok(!captured.some((l) => l.level === "error" && l.msg.includes("AbortError")), `no bare AbortError error log, got: ${JSON.stringify(captured.filter((l) => l.level === "error"))}`);
     } finally {
@@ -179,7 +179,7 @@ test("#411 abort storm: repeated client cancels do not accumulate upstream timer
             await reader.read();
             await reader.read();
             ac.abort();
-            await waitFor(() => _liveUpstreamTimersForTest() === 0);
+            await waitFor(() => _liveUpstreamTimersForTest() === 0, "live upstream timers back to 0");
         }
         assert.equal(_liveUpstreamTimersForTest(), 0);
     } finally {
@@ -204,8 +204,8 @@ test("#411 upstream cut with client alive: usage still lands, failure is a real 
         } catch {
             // upstream socket destroyed mid-stream — the client sees a cut
         }
-        await waitFor(() => listSessions().some((s) => s.stats.lastInputTokens === 1234));
-        await waitFor(() => _liveUpstreamTimersForTest() === 0);
+        await waitFor(() => listSessions().some((s) => s.stats.lastInputTokens === 1234), "sniffed usage recorded (1234 input tokens)");
+        await waitFor(() => _liveUpstreamTimersForTest() === 0, "live upstream timers back to 0");
         assert.ok(!captured.some((l) => l.msg.includes("client aborted mid-stream")), "client-alive cut must not be classified as a client abort");
     } finally {
         setLogCapture(null);
@@ -229,7 +229,7 @@ test("#411 plugin non-stream: client abort mid-body does not crash and clears th
                 // aborted mid-body — expected
             }
         });
-        await waitFor(() => _liveUpstreamTimersForTest() === 0);
+        await waitFor(() => _liveUpstreamTimersForTest() === 0, "live upstream timers back to 0");
     } finally {
         await rig.closeAll();
     }
@@ -246,7 +246,7 @@ test("#411 anonymous passthrough: client abort clears the timer and logs info", 
         const reader = res.body!.getReader();
         await reader.read();
         ac.abort();
-        await waitFor(() => _liveUpstreamTimersForTest() === 0);
+        await waitFor(() => _liveUpstreamTimersForTest() === 0, "live upstream timers back to 0");
         assert.ok(!captured.some((l) => l.level === "error" && l.msg.includes("AbortError")), `no bare AbortError error log, got: ${JSON.stringify(captured.filter((l) => l.level === "error"))}`);
     } finally {
         setLogCapture(null);
