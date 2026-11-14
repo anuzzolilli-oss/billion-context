@@ -133,6 +133,11 @@ interface RouteZcodeOptions {
      *  exemptions — call sites that resolve config themselves (bootstrap,
      *  watchdog, handoff) pass their resolved policy through. */
     readonly policy?: ZcodeRoutePolicy;
+    /** Asked while holding the config lock, immediately before the write.
+     *  Returning false leaves the store untouched and the call returns
+     *  undefined. For callers whose right to write can lapse while they wait
+     *  for the lock (the watchdog once shutdown has begun). */
+    readonly shouldWrite?: () => boolean;
 }
 
 // #1002 snapshot discipline: .bili-bak holds the state before bili's LATEST
@@ -264,9 +269,15 @@ export async function routeZcodeConfig(opts: RouteZcodeOptions): Promise<ZcodeRo
         logNoRouteNextSteps({ kind, dataDir, env, origin: opts.origin, policy, skipped: applied.skipped, log });
         return undefined;
     }
-    await withConfigLock(dataDir, () => {
+    const written = await withConfigLock(dataDir, () => {
+        if (opts.shouldWrite && !opts.shouldWrite()) return false;
         snapshotAndWrite(file, applied.text);
+        return true;
     });
+    if (!written) {
+        log("route write declined by the caller — leaving the config untouched");
+        return undefined;
+    }
     // Re-apply against the written text to catch self-apply corruption early
     // (must be a fixed point: same wrapped set, byte-stable output).
     const check = applyZcodeRouting(fs.readFileSync(file, "utf8"), kind, opts.origin, policy);

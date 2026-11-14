@@ -105,13 +105,21 @@ export async function zcodeWatchdogTick(state: MutableZcodeWatchdogState, extern
                 state.routing = origin;
                 process.env.BILI_MCP_PROXY = origin;
                 const route = deps.route ?? routeZcodeConfig;
-                const routed = await route({ origin, log, policy: state.policy });
-                if (!routed) throw new Error("proxy respawned but the zcode config rewrite failed");
-                const activate = deps.activate ?? activateZcodePluginMode;
-                await activate(routed, { log });
-                state.origin = origin;
-                state.routing = undefined;
-                log(`proxy respawned at ${origin} — config re-routed`);
+                // The write waits for the config lock; a shutdown that begins
+                // meanwhile runs the exit handoff, and a route written after
+                // it would be left pointing at a proxy no session owns.
+                const routed = await route({ origin, log, policy: state.policy, shouldWrite: () => !state.stopped });
+                if (!routed && state.stopped) {
+                    state.routing = undefined;
+                    log(`proxy respawned at ${origin} during shutdown — route not written, routing left to the exit handoff`);
+                } else {
+                    if (!routed) throw new Error("proxy respawned but the zcode config rewrite failed");
+                    const activate = deps.activate ?? activateZcodePluginMode;
+                    await activate(routed, { log });
+                    state.origin = origin;
+                    state.routing = undefined;
+                    log(`proxy respawned at ${origin} — config re-routed`);
+                }
             }
             state.failures = 0;
         }

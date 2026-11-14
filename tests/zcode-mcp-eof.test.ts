@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { EventEmitter } from "node:events";
 import * as entry from "../src/zcode/mcp-entry.ts";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { defaultZcodeRoutePolicy, detectCurrentZcodeOrigin, zcodeStoreCandidates } from "../src/zcode/json-edit.ts";
@@ -165,6 +165,142 @@ for (const blockedAt of ["activate", "ensure"] as const) {
             await stop();
             assert.equal(detectCurrentZcodeOrigin(dir, {}), undefined);
             assert.equal(routes, blockedAt === "activate" ? 1 : 0);
+        } finally { clearTimeout(hold); blocked.resolve(); await stop(); rmrf(dir); }
+    });
+}
+
+for (const signalled of [true, false]) {
+    test(`watchdog replacement waiting on the config lock writes its route only if shutdown has not begun (signalled=${signalled})`, { timeout: 8000 }, async () => {
+        const dir = routedStore();
+        const lockDir = path.join(dir, "v2", ".bili-config.lock");
+        const entered = deferred();
+        const exited = deferred();
+        const emitter = new EventEmitter();
+        const exits: number[] = [];
+        const logs: string[] = [];
+        let storeAtExit: string | undefined = "unset";
+        const state = { origin: OLD, failures: 2, policy: defaultZcodeRoutePolicy() };
+        await routeZcodeConfig({ origin: OLD, dataDir: dir, env: {}, log: () => {} });
+        // Another live process holds the config lock, so the replacement's
+        // write waits inside routeZcodeConfig.
+        const holdLock = () => { mkdirSync(lockDir); writeFileSync(path.join(lockDir, "pid"), String(process.pid)); };
+        const releaseLock = () => rmSync(lockDir, { recursive: true, force: true });
+        holdLock();
+        const stop = entry.startWatchdog(state, false, (msg) => logs.push(msg), {
+            intervalMs: 1,
+            probe: async () => false,
+            ensure: async () => ({ origin: NEW }),
+            route: (opts) => { entered.resolve(); return routeZcodeConfig({ ...opts, dataDir: dir, env: {}, log: () => {} }); },
+            activate: async () => {},
+            repair: async () => {},
+        });
+        entry.installExitHandoff(state, () => {}, {
+            events: emitter,
+            handoff: async (ownOrigin) => {
+                const outcome = await handoffZcodeRoutingOnExit({ ownOrigin, dataDir: dir, env: {}, log: () => {}, findReplacement: async () => undefined });
+                // The lock frees after the handoff finished but before the
+                // process exits; the waiting replacement gets its turn.
+                releaseLock();
+                await delay(300);
+                return outcome;
+            },
+            exit: (code) => { exits.push(code); storeAtExit = detectCurrentZcodeOrigin(dir, {}); exited.resolve(); },
+        });
+        const hold = setTimeout(() => {}, 8000);
+        try {
+            await entered.promise;
+            assert.equal(detectCurrentZcodeOrigin(dir, {}), OLD);
+            if (signalled) {
+                emitter.emit("SIGTERM");
+                await exited.promise;
+                assert.deepEqual(exits, [143]);
+                assert.equal(storeAtExit, undefined, "no route may be written after the exit handoff reverted the store");
+                await stop();
+                assert.equal(detectCurrentZcodeOrigin(dir, {}), undefined);
+                assert.equal(state.origin, OLD);
+                assert.doesNotMatch(logs.join("\n"), /watchdog error/);
+            } else {
+                releaseLock();
+                for (let i = 0; i < 50 && state.origin !== NEW; i++) await delay(20);
+                assert.equal(state.origin, NEW);
+                assert.equal(detectCurrentZcodeOrigin(dir, {}), NEW);
+                await stop();
+            }
+        } finally { clearTimeout(hold); releaseLock(); await stop(); rmrf(dir); }
+    });
+}
+
+for (const allow of [true, false]) {
+    test(`routeZcodeConfig asks shouldWrite under the config lock and writes only on true (allow=${allow})`, async () => {
+        const dir = routedStore();
+        const file = zcodeStoreCandidates(dir, "legacy", {})[0];
+        const lockDir = path.join(dir, "v2", ".bili-config.lock");
+        const logs: string[] = [];
+        const lockHeld: boolean[] = [];
+        try {
+            const before = readFileSync(file, "utf8");
+            const routed = await routeZcodeConfig({
+                origin: NEW, dataDir: dir, env: {}, log: (msg) => logs.push(msg),
+                shouldWrite: () => { lockHeld.push(existsSync(lockDir)); return allow; },
+            });
+            assert.deepEqual(lockHeld, [true]);
+            assert.equal(existsSync(lockDir), false);
+            if (allow) {
+                assert.equal(routed?.origin, NEW);
+                assert.equal(detectCurrentZcodeOrigin(dir, {}), NEW);
+                assert.doesNotMatch(logs.join("\n"), /declined/);
+            } else {
+                assert.equal(routed, undefined);
+                assert.equal(readFileSync(file, "utf8"), before);
+                assert.match(logs.join("\n"), /route write declined/);
+            }
+        } finally { rmrf(dir); }
+    });
+}
+
+for (const attachable of [true, false]) {
+    test(`EOF during a watchdog respawn leaves routing to the exit handoff (respawned proxy attachable=${attachable})`, { timeout: 5000 }, async (t) => {
+        // The handoff reports runtime-info to the replacement it routes to;
+        // answer it here so the test never contacts a port it does not own.
+        const posted: string[] = [];
+        t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0]) => {
+            posted.push(String(input));
+            return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+        });
+        const dir = routedStore();
+        const blocked = deferred();
+        const entered = deferred();
+        let routes = 0;
+        const state = { origin: OLD, failures: 2, policy: defaultZcodeRoutePolicy() };
+        await routeZcodeConfig({ origin: OLD, dataDir: dir, env: {}, log: () => {} });
+        const stop = entry.startWatchdog(state, false, () => {}, {
+            intervalMs: 1,
+            probe: async () => false,
+            ensure: async () => { entered.resolve(); await blocked.promise; return { origin: NEW }; },
+            route: async (opts) => { routes++; return routeZcodeConfig({ ...opts, dataDir: dir, env: {}, log: () => {} }); },
+            activate: async () => {},
+            repair: async () => {},
+        });
+        const handoff = entry.installExitHandoff(state, () => {}, {
+            events: new EventEmitter(),
+            handoff: (ownOrigin) => handoffZcodeRoutingOnExit({
+                ownOrigin, dataDir: dir, env: {}, log: () => {},
+                findReplacement: async () => (attachable ? { origin: NEW } : undefined),
+            }),
+            exit: () => { assert.fail("EOF must not force exit"); },
+        });
+        const hold = setTimeout(() => {}, 5000);
+        try {
+            await entered.promise;
+            const drained = stop().then(handoff);
+            blocked.resolve();
+            await drained;
+            // The tick never routes to the proxy it spawned during shutdown;
+            // the handoff routes to it only when discovery reports it live.
+            assert.equal(routes, 0);
+            assert.equal(state.origin, OLD);
+            assert.equal(detectCurrentZcodeOrigin(dir, {}), attachable ? NEW : undefined);
+            assert.deepEqual(posted, attachable ? [`${NEW}/__bili/plugin/runtime-info`] : []);
         } finally { clearTimeout(hold); blocked.resolve(); await stop(); rmrf(dir); }
     });
 }
