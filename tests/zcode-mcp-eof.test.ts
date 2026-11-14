@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { EventEmitter } from "node:events";
 import * as entry from "../src/zcode/mcp-entry.ts";
-import { defaultZcodeRoutePolicy } from "../src/zcode/json-edit.ts";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { defaultZcodeRoutePolicy, detectCurrentZcodeOrigin, zcodeStoreCandidates } from "../src/zcode/json-edit.ts";
+import { handoffZcodeRoutingOnExit, routeZcodeConfig } from "../src/zcode/native.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 function deferred() {
     let resolve!: () => void;
@@ -103,6 +108,64 @@ for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]] as const) {
         await delay(0);
         assert.equal(calls, 1);
         assert.deepEqual(exits, [code]);
+    });
+}
+
+const OLD = "http://127.0.0.1:18787";
+const NEW = "http://127.0.0.1:28787";
+
+function routedStore(): string {
+    const dir = mkdtempSync(path.join(tmpdir(), "zcode-eof-"));
+    mkdirSync(path.join(dir, "v2"), { recursive: true });
+    writeFileSync(
+        zcodeStoreCandidates(dir, "legacy", {})[0],
+        JSON.stringify({ provider: { "builtin:bigmodel-coding-plan": { options: { baseURL: "https://open.bigmodel.cn/api/anthropic" } } } }) + "\n",
+    );
+    return dir;
+}
+
+for (const blockedAt of ["activate", "ensure"] as const) {
+    test(`signal during a watchdog replacement hands off the route the replacement wrote (blocked in ${blockedAt})`, { timeout: 5000 }, async () => {
+        const dir = routedStore();
+        const blocked = deferred();
+        const entered = deferred();
+        const exited = deferred();
+        const emitter = new EventEmitter();
+        const exits: number[] = [];
+        let routes = 0;
+        const state = { origin: OLD, failures: 2, policy: defaultZcodeRoutePolicy() };
+        await routeZcodeConfig({ origin: OLD, dataDir: dir, log: () => {} });
+        const stop = entry.startWatchdog(state, false, () => {}, {
+            intervalMs: 1,
+            probe: async () => false,
+            ensure: async () => {
+                if (blockedAt === "ensure") { entered.resolve(); await blocked.promise; }
+                return { origin: NEW };
+            },
+            route: async (opts) => { routes++; return routeZcodeConfig({ ...opts, dataDir: dir, log: () => {} }); },
+            activate: async () => {
+                if (blockedAt === "activate") { entered.resolve(); await blocked.promise; }
+            },
+            repair: async () => {},
+        });
+        entry.installExitHandoff(state, () => {}, {
+            events: emitter,
+            handoff: (ownOrigin) => handoffZcodeRoutingOnExit({ ownOrigin, dataDir: dir, log: () => {}, findReplacement: async () => undefined }),
+            exit: (code) => { exits.push(code); exited.resolve(); },
+        });
+        const hold = setTimeout(() => {}, 5000);
+        try {
+            await entered.promise;
+            assert.equal(detectCurrentZcodeOrigin(dir), blockedAt === "activate" ? NEW : OLD);
+            emitter.emit("SIGTERM");
+            await exited.promise;
+            assert.deepEqual(exits, [143]);
+            assert.equal(detectCurrentZcodeOrigin(dir), undefined);
+            blocked.resolve();
+            await stop();
+            assert.equal(detectCurrentZcodeOrigin(dir), undefined);
+            assert.equal(routes, blockedAt === "activate" ? 1 : 0);
+        } finally { clearTimeout(hold); blocked.resolve(); await stop(); rmrf(dir); }
     });
 }
 
