@@ -118,6 +118,8 @@ export const LIVE_FILES = [
     // the tripwire alone, like #3890/#5114
     "tests/cache-keepalive.test.ts",
     "tests/mcp-eof.test.ts",
+    // #69: spawns real process trees to exercise the CI stall watch; no ports.
+    "tests/ci-stall-watch.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

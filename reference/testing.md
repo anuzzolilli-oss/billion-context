@@ -46,6 +46,24 @@ A bare `node --import tsx --test ...` still works (the storage family pins its
 own dirs), but any suite that relies on DEFAULT path resolution will write
 into your real machine state — prefer the preload chain.
 
+## CI: stall watch (#69)
+
+Every phase `scripts/run-ci-tests.mjs` starts (the main run, the full retry and
+the isolated re-runs) runs under `scripts/ci-stall-watch.mjs`. A phase that
+prints nothing on stdout and stderr for 10 minutes is treated as stalled: the
+runner lists the processes still alive under it (a finished test file's process
+is gone, so the list names the stuck file and anything it left running), kills
+the whole process tree, and fails the job. A stall is never retried and never
+reaches the failure-shape classifier — it stays a red job until its cause is
+known. `node --test` holds back later files' output until the file at the head
+of its order finishes, which is why one hung file used to silence a whole shard
+until the 90-minute job timeout (#61).
+
+The limit is a constant, not a setting. It was chosen against the longest quiet
+gap seen in 20 passing windows-latest / Node 24 shard jobs on 2026-11-14
+(238.5 s). A hang that keeps printing is not detected. When a job fails with
+`STALL:` lines, copy the process list to the issue tracking that stall.
+
 ## CI: test schedule (#2816)
 
 The main CI `test` job does not run the flat `npm test` glob — it runs

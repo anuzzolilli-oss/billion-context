@@ -80,10 +80,18 @@
 // own files (tests/issue760-percall-conversation.test.ts,
 // tests/storage-full-flip.test.ts) — classifier and widening are belt and
 // suspenders, not alternatives.
-import { execFileSync, spawn } from "node:child_process";
+//
+// #69: every phase (main, full retry, isolated re-runs) runs under the stall
+// watch in ci-stall-watch.mjs. A phase that prints nothing for 10 minutes is
+// reported (processes still alive under it), killed as a tree, and FAILS the
+// job right there: it never reaches the classifier or the retry below, because
+// a TAP stream cut off by the kill has no tail and must not be read as one of
+// the recoverable shapes. A stall is not a flake until its cause is known (#61).
+import { execFileSync } from "node:child_process";
 import { LIVE_FILES } from "./live-files.mjs";
 import { classifyPhaseFailure, describeDrainPass, describeRetryOutcome, extractDrainCancelledTests, shouldDrainPass } from "./ci-failure-shapes.mjs";
 import { partitionAll as partitionFiles } from "./ci-shard-partition.mjs";
+import { runWatched } from "./ci-stall-watch.mjs";
 import { readdirSync, readFileSync } from "node:fs";
 import { freemem, loadavg, totalmem } from "node:os";
 import { join } from "node:path";
@@ -187,46 +195,55 @@ const PRELOAD_ARGS = ["--import", "./tests/preload-storage-baseline.mjs", "--imp
 const MAX_CAPTURE = 32 * 1024 * 1024; // bound in-memory capture; real runs are MB-scale
 
 function runNodeTest(files, concurrency, label) {
-    const t0 = Date.now();
     console.log(`[ci-tests] ${label}: ${files.length} files, concurrency=${concurrency}`);
-    return new Promise((resolve) => {
-        const child = spawn(
-            process.execPath,
-            [...PRELOAD_ARGS, "--test", "--test-concurrency", String(concurrency), "--test-reporter=tap", ...files],
-            { cwd: root },
-        );
-        const out = [];
-        const err = [];
-        let outLen = 0;
-        let errLen = 0;
-        child.stdout.on("data", (d) => {
-            if (outLen < MAX_CAPTURE) {
-                out.push(d);
-                outLen += d.length;
-            }
-            process.stdout.write(d);
-        });
-        child.stderr.on("data", (d) => {
-            if (errLen < MAX_CAPTURE) {
-                err.push(d);
-                errLen += d.length;
-            }
-            process.stderr.write(d);
-        });
-        child.on("error", (e) => {
-            console.error(`[ci-tests] ${label}: spawn error: ${e.message}`);
-            resolve({ code: -1, signal: null, out: "", err: "", ms: Date.now() - t0 });
-        });
-        child.on("close", (code, signal) => {
-            resolve({
-                code,
-                signal,
-                out: Buffer.concat(out).toString("utf8"),
-                err: Buffer.concat(err).toString("utf8"),
-                ms: Date.now() - t0,
-            });
-        });
+    const out = [];
+    const err = [];
+    let outLen = 0;
+    let errLen = 0;
+    return runWatched(
+        process.execPath,
+        [...PRELOAD_ARGS, "--test", "--test-concurrency", String(concurrency), "--test-reporter=tap", ...files],
+        {
+            cwd: root,
+            label,
+            onStdout: (d) => {
+                if (outLen < MAX_CAPTURE) {
+                    out.push(d);
+                    outLen += d.length;
+                }
+                process.stdout.write(d);
+            },
+            onStderr: (d) => {
+                if (errLen < MAX_CAPTURE) {
+                    err.push(d);
+                    errLen += d.length;
+                }
+                process.stderr.write(d);
+            },
+        },
+    ).then((r) => {
+        if (r.spawnError) console.error(`[ci-tests] ${label}: spawn error: ${r.spawnError.message}`);
+        return {
+            code: r.code,
+            signal: r.signal,
+            stalled: r.stalled,
+            out: r.spawnError ? "" : Buffer.concat(out).toString("utf8"),
+            err: r.spawnError ? "" : Buffer.concat(err).toString("utf8"),
+            ms: r.ms,
+        };
     });
+}
+
+// #69: a stalled phase is terminal. Called before anything reads the phase's
+// exit code or TAP, so a stall can neither be retried nor pass.
+function failIfStalled(r, label) {
+    if (!r.stalled) return;
+    console.error(
+        `[ci-tests] ${label} STALLED after ${(r.ms / 1000).toFixed(1)}s and was killed -> failing WITHOUT retry (#69). ` +
+            `The process list above names what was still running; record it on the stall's issue (#61 for tests/dsh-native.test.ts).`,
+    );
+    console.error(`[ci-tests] resource snapshot: ${resourceSnapshot()}`);
+    process.exit(1);
 }
 
 function resourceSnapshot() {
@@ -239,22 +256,21 @@ function resourceSnapshot() {
 }
 
 function runIsolated(fileRel) {
-    const t0 = Date.now();
     console.log(`[ci-tests] DIAGNOSTIC isolated re-run (serial): ${fileRel} — full output below`);
-    return new Promise((resolve) => {
-        const child = spawn(process.execPath, [...PRELOAD_ARGS, "--test", "--test-reporter=tap", fileRel], { cwd: root });
-        child.stdout.on("data", (d) => process.stdout.write(d));
-        child.stderr.on("data", (d) => process.stderr.write(d));
-        child.on("error", (e) => {
-            console.error(`[ci-tests] isolated re-run ${fileRel}: spawn error: ${e.message}`);
-            resolve({ code: -1, signal: null, ms: Date.now() - t0 });
-        });
-        child.on("close", (code, signal) => resolve({ code, signal, ms: Date.now() - t0 }));
+    return runWatched(process.execPath, [...PRELOAD_ARGS, "--test", "--test-reporter=tap", fileRel], {
+        cwd: root,
+        label: `isolated re-run ${fileRel}`,
+        onStdout: (d) => process.stdout.write(d),
+        onStderr: (d) => process.stderr.write(d),
+    }).then((r) => {
+        if (r.spawnError) console.error(`[ci-tests] isolated re-run ${fileRel}: spawn error: ${r.spawnError.message}`);
+        return { code: r.code, signal: r.signal, stalled: r.stalled, ms: r.ms };
     });
 }
 
 (async () => {
     const first = await runNodeTest(selectedFiles, 4, "all");
+    failIfStalled(first, "all");
     if (first.code === 0) {
         console.log(`[ci-tests] all ok in ${(first.ms / 1000).toFixed(1)}s`);
         return;
@@ -289,6 +305,7 @@ function runIsolated(fileRel) {
         );
         for (const rel of verdict.files) {
             const r = await runIsolated(rel);
+            failIfStalled(r, `isolated re-run ${rel}`);
             console.error(
                 `[ci-tests] isolated re-run ${rel}: exit=${r.code} signal=${r.signal} (${(r.ms / 1000).toFixed(1)}s) -> ` +
                     (r.code === 0
@@ -322,6 +339,7 @@ function runIsolated(fileRel) {
     const retryIssue = { swallowed: "#3029", "cancelled-drain": "#3665", "cleanup-lock": "#4347", "timing-window": "#4161" }[verdict.kind];
     console.error(`[ci-tests] retrying full phase once to confirm flake (${retryIssue})`);
     const retry = await runNodeTest(selectedFiles, 4, "all (retry)");
+    failIfStalled(retry, "all (retry)");
     if (retry.code === 0) {
         const firstSummary =
             verdict.kind === "swallowed"
