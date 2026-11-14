@@ -214,13 +214,6 @@ test("watchdogTick: a failed bring-up keeps the counter hot — immediate retry 
     assert.equal(f.state.failures, 0);
 });
 
-// Known issue #48: below Node 24 the unreferenced watchdog interval can let the
-// event loop drain while a test waits for a watchdog tick, and the runner then
-// cancels that test and every later one in this file. Skipped there until the
-// wait is fixed; the test runs unchanged on Node 24 and later.
-const NODE_MAJOR = Number(process.versions.node.split(".")[0]);
-const skipLoopDrain = NODE_MAJOR < 24 ? "known issue #48: event-loop drain below Node 24" : false;
-
 test("startWatchdog stop blocks recovery from an outstanding failed probe", { timeout: 5000 }, async () => {
     let release!: (healthy: boolean) => void;
     let entered!: () => void;
@@ -231,16 +224,21 @@ test("startWatchdog stop blocks recovery from an outstanding failed probe", { ti
         probe: () => { entered(); return new Promise<boolean>((resolve) => { release = resolve; }); },
         ensure: async () => { recoveries += 1; return { origin: ORIGIN, port: 0 }; },
     });
+    // The watchdog interval is unreferenced, so this referenced timer is what
+    // keeps the event loop alive while the test waits for a watchdog tick.
+    // Without it the process can end mid-wait and the runner cancels this
+    // test and every later one in the file (seen below Node 24, #46 / #48).
+    const hold = setTimeout(() => {}, 5000);
     try {
         await probing;
         const stopped = stop();
         release(false);
         await stopped;
         assert.equal(recoveries, 0);
-    } finally { release?.(false); await stop(); }
+    } finally { clearTimeout(hold); release?.(false); await stop(); }
 });
 
-test("startWatchdog stop joins recovery already underway", { timeout: 5000, skip: skipLoopDrain }, async () => {
+test("startWatchdog stop joins recovery already underway", { timeout: 5000 }, async () => {
     let release!: () => void;
     let entered!: () => void;
     const recovering = new Promise<void>((resolve) => { entered = resolve; });
@@ -256,6 +254,8 @@ test("startWatchdog stop joins recovery already underway", { timeout: 5000, skip
         },
         repin: () => [],
     });
+    // Holds the event loop open during the watchdog wait; see the test above.
+    const hold = setTimeout(() => {}, 5000);
     try {
         await recovering;
         const stopped = stop().then(() => { joined = true; });
@@ -264,7 +264,7 @@ test("startWatchdog stop joins recovery already underway", { timeout: 5000, skip
         release();
         await stopped;
         assert.equal(state.origin, DRIFTED);
-    } finally { release?.(); await stop(); }
+    } finally { clearTimeout(hold); release?.(); await stop(); }
 });
 
 for (const rejects of [false, true]) {
