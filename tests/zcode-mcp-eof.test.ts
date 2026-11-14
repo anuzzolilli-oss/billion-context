@@ -259,7 +259,14 @@ for (const allow of [true, false]) {
 }
 
 for (const attachable of [true, false]) {
-    test(`EOF during a watchdog respawn leaves routing to the exit handoff (respawned proxy attachable=${attachable})`, { timeout: 5000 }, async () => {
+    test(`EOF during a watchdog respawn leaves routing to the exit handoff (respawned proxy attachable=${attachable})`, { timeout: 5000 }, async (t) => {
+        // The handoff reports runtime-info to the replacement it routes to;
+        // answer it here so the test never contacts a port it does not own.
+        const posted: string[] = [];
+        t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0]) => {
+            posted.push(String(input));
+            return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+        });
         const dir = routedStore();
         const blocked = deferred();
         const entered = deferred();
@@ -293,6 +300,7 @@ for (const attachable of [true, false]) {
             assert.equal(routes, 0);
             assert.equal(state.origin, OLD);
             assert.equal(detectCurrentZcodeOrigin(dir, {}), attachable ? NEW : undefined);
+            assert.deepEqual(posted, attachable ? [`${NEW}/__bili/plugin/runtime-info`] : []);
         } finally { clearTimeout(hold); blocked.resolve(); await stop(); rmrf(dir); }
     });
 }
