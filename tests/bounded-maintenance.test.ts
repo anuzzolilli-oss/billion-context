@@ -49,6 +49,10 @@ async function scenario(enabled: boolean, mode = "success") {
             if (mode === "off-path") await mainArrived;
             if (mode === "watchdog") await new Promise(resolve => setTimeout(resolve, 1500));
             if (overflowMode) await maintenanceBarrier;
+            // Only an answered retry gets here in the retry scenarios. It is
+            // held well past the first attempt's 25 ms deadline, so a retry
+            // still bound by that deadline fails every time, not sometimes.
+            if (retryMode) await new Promise(resolve => setTimeout(resolve, 100));
             maintenanceReplies++;
             res.writeHead(200, { "content-type": "application/json" });
             const span = /exactly (m\d+\u2013m\d+)/.exec(JSON.stringify(body))?.[1];
