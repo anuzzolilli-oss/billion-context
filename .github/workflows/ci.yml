@@ -55,7 +55,7 @@ on:
   workflow_dispatch:
     inputs:
       full:
-        description: "Run the FULL matrix (12 test legs + 4 static legs) instead of the CORE one"
+        description: "Run the FULL matrix scope (on the fork it has the same legs as CORE: windows-latest, Node 24)"
         type: boolean
         default: false
 
@@ -81,23 +81,21 @@ concurrency:
 jobs:
   # Three-layer CI (#3295) plan: decide the matrix scope BEFORE paying for
   # legs. One cheap ubuntu job picks one of three scopes:
-   #   core — every PR (push) and master push: 11 test legs (ubuntu 22/24 at
-   #          /3, windows 22 at /5 — #4351 rebalance, then duration-weighted
-   #          re-shard below) + 2
-  #          static legs (ubuntu 24, windows 22 — #3406 item 8: the windows
-  #          static leg keeps typecheck/build + the kernel/pi-subagents
-  #          suites covered on windows for EVERY PR, not only ci:full/nightly).
-   #          The blocking layer. master's required-checks list still carries
-   #          the legacy 12 FULL-matrix leg names; core produces 11 of the 16
-   #          current names (windows node-24 legs appear only in FULL scope),
-   #          and the four NEW windows shard-4/5 names must be added to branch
-   #          protection before they gate merges, enforce_admins off.
+  #   core — every PR and release/bugfix branch push: 5 test legs
+  #          (windows-latest, Node 24, /5) + 1 static leg (windows-latest,
+  #          Node 24). Fork scope (fork issue #53): Windows on Node 24 is
+  #          this fork's only deployment environment, so the ubuntu legs and
+  #          every Node 22 leg were dropped from both scopes. The fork has no
+  #          branch protection, so no required-check names depend on the
+  #          dropped legs.
   #   full — `ci:full` label on a PR, a release PR (#3688: bot-authored
   #          one-click fallback PRs, *_release-v* head branches, or a
   #          "[PR] release…"/"release vN…" title — no label needed),
   #          workflow_dispatch full=true, or the 30-min
    #          cron when master moved since the last green scheduled run: the
-   #          full 16-leg test matrix + 4-leg static-gates.
+  #          same 5 test legs + 1 static leg as core (the two scopes are
+  #          identical on the fork; both variables are kept so the plan logic
+  #          stays untouched).
   #   skip — a `labeled` event for a label other than ci:full, or a cron tick
   #          where master HEAD == the last green scheduled run's head: nothing
   #          to do, every dependent job skips (run concludes success so the
@@ -148,43 +146,22 @@ jobs:
            # re-balance: line-count LPT balanced bytes, not seconds — see
            # scripts/ci-shard-partition.mjs): partitionAll stays total for any
            # i/N, so union of shards == every file — zero coverage loss; wall
-           # drops to the slowest shard (~7 min windows target). The windows
-           # node-24 legs stay FULL-only.
+           # drops to the slowest shard (~7 min windows target).
+          # Fork issue #53: only the windows-latest Node 24 combo remains, at /5.
           CORE_TEST='{"include":[
-            {"os":"ubuntu-latest","node-version":22,"shard":1,"shardTotal":3},
-            {"os":"ubuntu-latest","node-version":22,"shard":2,"shardTotal":3},
-            {"os":"ubuntu-latest","node-version":22,"shard":3,"shardTotal":3},
-            {"os":"ubuntu-latest","node-version":24,"shard":1,"shardTotal":3},
-            {"os":"ubuntu-latest","node-version":24,"shard":2,"shardTotal":3},
-            {"os":"ubuntu-latest","node-version":24,"shard":3,"shardTotal":3},
-            {"os":"windows-latest","node-version":22,"shard":1,"shardTotal":5},
-            {"os":"windows-latest","node-version":22,"shard":2,"shardTotal":5},
-            {"os":"windows-latest","node-version":22,"shard":3,"shardTotal":5},
-            {"os":"windows-latest","node-version":22,"shard":4,"shardTotal":5},
-            {"os":"windows-latest","node-version":22,"shard":5,"shardTotal":5}]}'
-          CORE_STATIC='{"include":[{"os":"ubuntu-latest","node-version":24},{"os":"windows-latest","node-version":22}]}'
-          FULL_TEST='{"include":[
-            {"os":"ubuntu-latest","node-version":22,"shard":1,"shardTotal":3},
-            {"os":"ubuntu-latest","node-version":22,"shard":2,"shardTotal":3},
-            {"os":"ubuntu-latest","node-version":22,"shard":3,"shardTotal":3},
-            {"os":"ubuntu-latest","node-version":24,"shard":1,"shardTotal":3},
-            {"os":"ubuntu-latest","node-version":24,"shard":2,"shardTotal":3},
-            {"os":"ubuntu-latest","node-version":24,"shard":3,"shardTotal":3},
-            {"os":"windows-latest","node-version":22,"shard":1,"shardTotal":5},
-            {"os":"windows-latest","node-version":22,"shard":2,"shardTotal":5},
-            {"os":"windows-latest","node-version":22,"shard":3,"shardTotal":5},
-            {"os":"windows-latest","node-version":22,"shard":4,"shardTotal":5},
-            {"os":"windows-latest","node-version":22,"shard":5,"shardTotal":5},
             {"os":"windows-latest","node-version":24,"shard":1,"shardTotal":5},
             {"os":"windows-latest","node-version":24,"shard":2,"shardTotal":5},
             {"os":"windows-latest","node-version":24,"shard":3,"shardTotal":5},
             {"os":"windows-latest","node-version":24,"shard":4,"shardTotal":5},
             {"os":"windows-latest","node-version":24,"shard":5,"shardTotal":5}]}'
-          FULL_STATIC='{"include":[
-            {"os":"ubuntu-latest","node-version":22},
-            {"os":"ubuntu-latest","node-version":24},
-            {"os":"windows-latest","node-version":22},
-            {"os":"windows-latest","node-version":24}]}'
+          CORE_STATIC='{"include":[{"os":"windows-latest","node-version":24}]}'
+          FULL_TEST='{"include":[
+            {"os":"windows-latest","node-version":24,"shard":1,"shardTotal":5},
+            {"os":"windows-latest","node-version":24,"shard":2,"shardTotal":5},
+            {"os":"windows-latest","node-version":24,"shard":3,"shardTotal":5},
+            {"os":"windows-latest","node-version":24,"shard":4,"shardTotal":5},
+            {"os":"windows-latest","node-version":24,"shard":5,"shardTotal":5}]}'
+          FULL_STATIC='{"include":[{"os":"windows-latest","node-version":24}]}'
           scope=core
           case "$EVENT" in
             pull_request)
@@ -351,7 +328,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
       - run: npm install --ignore-scripts --no-fund --no-audit
       # #4336: the storage suites transitively import acp-kernel at runtime
