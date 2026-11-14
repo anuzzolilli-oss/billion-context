@@ -25,11 +25,12 @@ cat > /tmp/pr.json <<'EOF'
   "title": "fix: short summary",
   "head": "YYYY-MM-DD_short-title",
   "base": "master",
+  "draft": true,
   "body": "what changed, why, and pre-flight results (typecheck / test / build)"
 }
 EOF
 
-# 4. open the PR (base is master)
+# 4. open the PR as a draft (base is master)
 curl -sS -f -X POST \
   -H "Authorization: Bearer $TOKEN" \
   -H "Accept: application/vnd.github+json" \
@@ -37,13 +38,27 @@ curl -sS -f -X POST \
   -H "Content-Type: application/json" \
   https://api.github.com/repos/ranxianglei/billion-context/pulls \
   -d @/tmp/pr.json
+
+# 5. once the work is finished, mark the PR ready for review. The REST API has no call
+#    for this; it takes the GraphQL mutation, keyed by the PR's node id: the top-level
+#    "node_id" of the step 4 response (it starts with PR_)
+PR_NODE_ID="PR_..."
+curl -sS -f -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  https://api.github.com/graphql \
+  -d '{"query":"mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}","variables":{"id":"'"$PR_NODE_ID"'"}}'
 ```
 
-A successful response contains `"state": "open"` and the `html_url` to post back to the
-issue; `-f` makes API errors (401/422) fail loudly instead of exiting 0 with an error JSON
-body. The credential helper is non-interactive — it either serves the token or fails, so if
-`git push` worked, the token extraction works. Never print the token; keep it in the variable
-only. Merging the PR stays human-only (`AGENTS.md` §4).
+A successful step 4 response contains `"state": "open"`, `"draft": true` and the `html_url`
+to post back to the issue. The PR opens as a draft so the automated reviewer runs once, on
+the finished work, and not on every push ([`AGENTS.md`](../AGENTS.md)): push follow-up
+commits while it is still a draft, and run step 5 last. A successful step 5 response
+contains `"isDraft":false`; GraphQL reports errors in an `errors` field with HTTP 200, so
+`-f` does not catch them there. In step 4, `-f` makes API errors (401/422) fail loudly
+instead of exiting 0 with an error JSON body. The credential helper is non-interactive — it
+either serves the token or fails, so if `git push` worked, the token extraction works. Never
+print the token; keep it in the variable only. Merging the PR stays human-only (`AGENTS.md` §4).
 
 ## External Contributors' PRs — Fix Directly, Don't Replace
 
