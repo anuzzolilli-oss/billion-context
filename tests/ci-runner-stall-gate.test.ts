@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { descendantsOf, killProcessTree, listProcesses } from "../scripts/ci-stall-watch.mjs";
 
 const REPO = process.cwd();
 const LIMIT_MS = 4000;
@@ -63,46 +64,85 @@ function makeSuite(steps: Step[]): string {
     return dir;
 }
 
-function runRunner(dir: string): Promise<{ code: number | null; out: string; runs: number }> {
+interface Finished {
+    code: number | null;
+    out: string;
+}
+
+interface RunOptions {
+    cwd: string;
+    env?: NodeJS.ProcessEnv;
+    timeoutMs?: number;
+    graceMs?: number;
+    /** Ends the process tree at the deadline. Injectable so a test can leave
+     *  the tree alive and prove the fallback settlement. */
+    kill?: (pid: number) => void;
+}
+
+function killTree(pid: number): void {
+    let known: ReturnType<typeof descendantsOf> = [];
+    try {
+        known = descendantsOf(pid, listProcesses());
+    } catch {
+        // no snapshot: the tree kill below still reaches the group / the tree
+    }
+    killProcessTree(pid, known);
+}
+
+/** Runs a command to its end and settles exactly once. Normally that is the
+ *  child's 'close'. At the deadline the whole tree is killed; if 'close' still
+ *  has not come graceMs later (something the kill did not reach holds the
+ *  output pipes), the streams are abandoned and the promise rejects anyway, so
+ *  the wait is bounded. Nothing runs after settlement: the caller's teardown
+ *  deletes the fixture directory. */
+function runToClose(command: string, args: string[], opts: RunOptions): Promise<Finished> {
+    const { cwd, env = process.env, timeoutMs = 120_000, graceMs = 15_000, kill = killTree } = opts;
+    return new Promise((resolve, reject) => {
+        // Its own process group on POSIX, so the deadline kill reaches every
+        // descendant, including ones started before the runner's own handlers.
+        const child = spawn(command, args, { cwd, env, detached: process.platform !== "win32" });
+        let out = "";
+        child.stdout.on("data", (d) => (out += d.toString()));
+        child.stderr.on("data", (d) => (out += d.toString()));
+        let settled = false;
+        let timedOut = false;
+        let fallback: NodeJS.Timeout | undefined;
+        const settle = (fn: () => void) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(deadline);
+            clearTimeout(fallback);
+            fn();
+        };
+        const timeoutError = (how: string) => new Error(`command did not finish in ${timeoutMs}ms (${how}). Output so far:\n${out}`);
+        const deadline = setTimeout(() => {
+            timedOut = true;
+            if (child.pid !== undefined) kill(child.pid);
+            fallback = setTimeout(() => {
+                child.stdin?.destroy();
+                child.stdout.destroy();
+                child.stderr.destroy();
+                child.unref();
+                settle(() => reject(timeoutError(`output pipes still open ${graceMs}ms after the kill; abandoned`)));
+            }, graceMs);
+        }, timeoutMs);
+        child.on("error", (e) => settle(() => reject(e)));
+        child.on("close", (code) => {
+            if (timedOut) return settle(() => reject(timeoutError("killed")));
+            settle(() => resolve({ code, out }));
+        });
+    });
+}
+
+async function runRunner(dir: string): Promise<Finished & { runs: number }> {
     const env = { ...process.env };
-    // The copy must run its own two files as a plain top-level `node --test`:
+    // The copy must run its own two files as a plain top-level node --test:
     // not this job's shard slice, and not as a nested child of this test run.
     delete env.CI_TEST_SHARD;
     delete env.NODE_TEST_CONTEXT;
     delete env.GITHUB_EVENT_NAME;
-    return new Promise((resolve, reject) => {
-        const child = spawn(process.execPath, ["scripts/run-ci-tests.mjs"], { cwd: dir, env });
-        let out = "";
-        child.stdout.on("data", (d) => (out += d.toString()));
-        child.stderr.on("data", (d) => (out += d.toString()));
-        // Settles once, and only after the child has closed: the caller's
-        // teardown deletes the fixture directory, so nothing may read it
-        // after this promise settles.
-        let timedOut = false;
-        let spawnError: Error | undefined;
-        const deadline = setTimeout(() => {
-            timedOut = true;
-            child.kill();
-        }, 120_000);
-        child.on("error", (e) => {
-            spawnError = e;
-            // A failed spawn emits no 'close'.
-            if (child.pid === undefined) {
-                clearTimeout(deadline);
-                reject(e);
-            }
-        });
-        child.on("close", (code) => {
-            clearTimeout(deadline);
-            if (spawnError) return reject(spawnError);
-            if (timedOut) return reject(new Error(`runner copy did not finish in 120s. Output so far:\n${out}`));
-            try {
-                resolve({ code, out, runs: JSON.parse(readFileSync(join(dir, "plan.json"), "utf8")).runs });
-            } catch (e) {
-                reject(e);
-            }
-        });
-    });
+    const r = await runToClose(process.execPath, ["scripts/run-ci-tests.mjs"], { cwd: dir, env });
+    return { ...r, runs: JSON.parse(readFileSync(join(dir, "plan.json"), "utf8")).runs };
 }
 
 const RETRY = /retrying full phase once/;
@@ -173,3 +213,99 @@ for (const c of CASES) {
         for (const re of c.lacks) assert.doesNotMatch(r.out, re, `unexpected ${re}${ctx}`);
     });
 }
+
+// The deadline in runToClose, which every case above relies on to stay bounded.
+// The fixture is the shape that used to hang it: a parent whose child inherits
+// the output pipes and outlives it.
+
+function alive(pid: number): boolean {
+    try {
+        process.kill(pid, 0);
+    } catch {
+        return false;
+    }
+    if (process.platform === "linux") {
+        // kill(pid, 0) also succeeds for a zombie, which is not running.
+        try {
+            const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+            if (stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3) === "Z") return false;
+        } catch {
+            return false;
+        }
+    }
+    return true;
+}
+
+async function waitDead(pids: number[], ms = 10_000): Promise<number[]> {
+    const end = Date.now() + ms;
+    for (;;) {
+        const left = pids.filter(alive);
+        if (left.length === 0 || Date.now() > end) return left;
+        await new Promise((r) => setTimeout(r, 100));
+    }
+}
+
+function pipeHolder(): { dir: string; script: string } {
+    mkdirSync(join(REPO, ".tmp"), { recursive: true });
+    const dir = mkdtempSync(join(REPO, ".tmp", "stall-gate-pipes-"));
+    writeFileSync(join(dir, "holder.mjs"), "setInterval(() => {}, 1000);\n");
+    const script = join(dir, "parent.mjs");
+    writeFileSync(
+        script,
+        [
+            'import { spawn } from "node:child_process";',
+            'const kid = spawn(process.execPath, ["holder.mjs"], { stdio: "inherit" });',
+            "console.log(`pids ${process.pid} ${kid.pid}`);",
+            "setInterval(() => {}, 1000);",
+            "",
+        ].join("\n"),
+    );
+    return { dir, script };
+}
+
+function pidsIn(message: string): number[] {
+    const m = message.match(/pids (\d+) (\d+)/);
+    assert.ok(m, `the fixture printed its pids (got: ${JSON.stringify(message)})`);
+    return [Number(m[1]), Number(m[2])];
+}
+
+test("the deadline kills the whole tree, including a child holding the output pipes", async (t) => {
+    const { dir, script } = pipeHolder();
+    t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
+    const t0 = Date.now();
+    const err = await runToClose(process.execPath, [script], { cwd: dir, timeoutMs: 2000, graceMs: 30_000 }).then(
+        () => undefined,
+        (e: Error) => e,
+    );
+    assert.ok(err, "a run past its deadline rejects");
+    assert.match(err.message, /did not finish in 2000ms \(killed\)/);
+    assert.ok(Date.now() - t0 < 20_000, "settled on the kill, well inside the grace");
+    assert.deepEqual(await waitDead(pidsIn(err.message)), [], "parent and pipe-holding child are both gone");
+});
+
+test("a pipe holder that survives the kill cannot keep the wait open", async (t) => {
+    const { dir, script } = pipeHolder();
+    let pids: number[] = [];
+    t.after(async () => {
+        for (const pid of pids) if (pid > 0) killProcessTree(pid);
+        await waitDead(pids);
+        rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    });
+    const t0 = Date.now();
+    // A kill that reaches nothing: both processes keep the pipes open.
+    const err = await runToClose(process.execPath, [script], { cwd: dir, timeoutMs: 2000, graceMs: 1500, kill: () => {} }).then(
+        () => undefined,
+        (e: Error) => e,
+    );
+    assert.ok(err, "the wait ends even though 'close' never came");
+    pids = pidsIn(err.message);
+    assert.match(err.message, /output pipes still open 1500ms after the kill; abandoned/);
+    assert.ok(Date.now() - t0 < 20_000, "bounded by deadline plus grace");
+    assert.ok(pids.every(alive), "the fixture really was still running when the wait ended");
+});
+
+test("control: a command that finishes in time resolves with its exit code and output", async () => {
+    const r = await runToClose(process.execPath, ["-e", "console.log('done'); process.exit(3)"], { cwd: REPO, timeoutMs: 30_000 });
+    assert.equal(r.code, 3);
+    assert.match(r.out, /done/);
+});
