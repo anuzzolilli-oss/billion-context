@@ -710,6 +710,73 @@ test("handoffZcodeRoutingOnExit reverts to direct when no replacement lives (#16
     }
 });
 
+for (const replacementFound of [false, true]) {
+    test(`handoffZcodeRoutingOnExit leaves a route another owner took during replacement discovery (replacement=${replacementFound})`, async () => {
+        const dir = dataDir();
+        const newOwner = "http://127.0.0.1:38787";
+        try {
+            await routeZcodeConfig({ origin: "http://127.0.0.1:18787", dataDir: dir, env: {}, log: NO_LOG });
+            let taken = "";
+            assert.equal(
+                await handoffZcodeRoutingOnExit({
+                    ownOrigin: "http://127.0.0.1:18787",
+                    dataDir: dir,
+                    env: {},
+                    log: NO_LOG,
+                    findReplacement: async () => {
+                        await routeZcodeConfig({ origin: newOwner, dataDir: dir, env: {}, log: NO_LOG });
+                        taken = readFileSync(storeFile(dir), "utf8");
+                        return replacementFound ? { origin: "http://127.0.0.1:28787" } : undefined;
+                    },
+                }),
+                "not-ours",
+            );
+            assert.equal(detectCurrentZcodeOrigin(dir, {}), newOwner);
+            assert.equal(readFileSync(storeFile(dir), "utf8"), taken);
+        } finally {
+            rmrf(dir);
+        }
+    });
+}
+
+for (const takenDuringReroute of [false, true]) {
+    test(`handoffZcodeRoutingOnExit after a refused re-route reverts only a route it still owns (taken=${takenDuringReroute})`, async () => {
+        const dir = mkdtempSync(path.join(tmpdir(), "zcode-native-refused-"));
+        mkdirSync(path.join(dir, "v2"), { recursive: true });
+        const file = zcodeStoreCandidates(dir, "new", {})[0];
+        writeFileSync(
+            file,
+            JSON.stringify({ schemaVersion: 1, config: { providerConfigRules: { providerRules: [{ providerId: "account:deepseek", config: { api: { baseUrl: "https://api.deepseek.com/v1" } } }] } } }) + "\n",
+        );
+        try {
+            assert.ok(await routeZcodeConfig({ origin: "http://127.0.0.1:18787", dataDir: dir, env: {}, log: NO_LOG }));
+            let taken: string | undefined;
+            const outcome = await handoffZcodeRoutingOnExit({
+                ownOrigin: "http://127.0.0.1:18787",
+                dataDir: dir,
+                // route:"plans" on the signing-era store makes the re-route refuse (#1621).
+                env: { BILI_ZCODE_ROUTE: "plans" },
+                log: (msg) => {
+                    if (!takenDuringReroute || taken !== undefined || !/client[- ]signing/.test(msg)) return;
+                    taken = readFileSync(file, "utf8").split("127.0.0.1:18787").join("127.0.0.1:38787");
+                    writeFileSync(file, taken);
+                },
+                findReplacement: async () => ({ origin: "http://127.0.0.1:28787" }),
+            });
+            if (takenDuringReroute) {
+                assert.equal(outcome, "not-ours");
+                assert.equal(detectCurrentZcodeOrigin(dir, {}), "http://127.0.0.1:38787");
+                assert.equal(readFileSync(file, "utf8"), taken);
+            } else {
+                assert.equal(outcome, "reverted-direct");
+                assert.doesNotMatch(readFileSync(file, "utf8"), /\/bili\//);
+            }
+        } finally {
+            rmrf(dir);
+        }
+    });
+}
+
 // #1892: the zero-wrapped path must explain itself instead of leaving the
 // client a bare "Connection closed". An empty personal store is NOT "no
 // provider" — this build sources active providers from the built-in/account
