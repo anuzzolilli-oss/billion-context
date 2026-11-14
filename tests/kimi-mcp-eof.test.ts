@@ -2,14 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { startWatchdog } from "../src/kimi/native-mcp.ts";
 
-// Known issue #48: below Node 24 the unreferenced watchdog interval can let the
-// event loop drain while a test waits for a watchdog tick, and the runner then
-// cancels that test and every later one in this file. Skipped there until the
-// wait is fixed; the test runs unchanged on Node 24 and later.
-const NODE_MAJOR = Number(process.versions.node.split(".")[0]);
-const skipLoopDrain = NODE_MAJOR < 24 ? "known issue #48: event-loop drain below Node 24" : false;
-
-test("Kimi stop blocks recovery from a pending failed probe", { timeout: 5000, skip: skipLoopDrain }, async () => {
+test("Kimi stop blocks recovery from a pending failed probe", { timeout: 5000 }, async () => {
     let release!: () => void;
     let entered!: () => void;
     const blocked = new Promise<void>((resolve) => { release = resolve; });
@@ -23,13 +16,18 @@ test("Kimi stop blocks recovery from a pending failed probe", { timeout: 5000, s
         modelWindows: () => undefined,
         ensure: async () => { recoveries++; return { origin: applied.origin, port: 1234, pid: 1, attached: false, stop: async () => {} }; },
     });
+    // The watchdog interval is unreferenced, so this referenced timer is what
+    // keeps the event loop alive while the test waits for a watchdog tick.
+    // Without it the process can end mid-wait and the runner cancels this
+    // test and every later one in the file (seen below Node 24, #46 / #48).
+    const hold = setTimeout(() => {}, 5000);
     try {
         await started;
         const stopped = stop();
         release();
         await stopped;
         assert.equal(recoveries, 0);
-    } finally { release(); await stop(); }
+    } finally { clearTimeout(hold); release(); await stop(); }
 });
 
 for (const rejects of [false, true]) {
