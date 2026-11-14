@@ -155,7 +155,7 @@ Env vars are a **scarce surface**: by default a new behavior knob becomes a conf
 
 ### Documentation Layout (owner ruling 2026-11-08, #5920)
 
-- **One hub.** All design/config/protocol/identity docs live under `docs/`. The repo root keeps only `README.md`, `README.zh-CN.md`, `AGENTS.md`, `CHANGELOG.md` (plus temporary redirect stubs per rule 5). New docs go in `docs/`, never at the root.
+- **One hub.** All design/config/protocol/identity docs live under `docs/`. The repo root keeps only `README.md`, `README.zh-CN.md`, `AGENTS.md`, `CHANGELOG.md` (plus temporary redirect stubs per rule 5). New docs go in `docs/`, never at the root. **One exception (owner ruling 2026-11-14):** `REVIEW.md`, the automated PR reviewer's policy file, stays at the root because the reviewer reads it only from the repository root of the base branch. It is tool configuration, not system documentation: English only, no `docs/index` entry, and `AGENTS.md` wins wherever the two disagree.
 - **Naming & language.** kebab-case English base name; bilingual (en + `<same>.zh-CN.md`) is the default (en/zh parity per §7.3). A single-language doc must state why in its `docs/index` entry.
 - **Index.** Every new or moved doc must be listed in `docs/index.md` AND `docs/index.zh-CN.md` in the same PR.
 - **Split with `reference/`.** `docs/` = decision/reviewer-facing reference material; `reference/` = AGENTS lazy-loaded construction procedures + the KDD full text ([design-decisions.md](design-decisions.md)). New how-to procedures → `reference/` (+ AGENTS.md pointer); new concepts/decisions → `docs/`.

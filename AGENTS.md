@@ -42,6 +42,7 @@ KDD numbers are stable. Tier A consequences remain here; full wording and all Ti
 - Updater changes require the owner-approved no-op validation release first. Security, identity/session binding, wire/config/persistence changes and fallback/default decisions remain human-gated.
 - One issue = one scope. Screen open AND closed issues/PRs first. Finished development requires a PR referencing its issue, not just a pushed branch. Separate discovered substantive problems; fix minor nonsemantic flaws in place.
 - Preserve contributor authorship: additive fixes to existing PR branches, never replace their contributions. Post-merge supplements use a new follow-up PR.
+- Open PRs as drafts (`"draft": true` in the REST payload) and mark them ready once the work is finished, so the automated reviewer runs once and not on every push. Its review policy is the root `REVIEW.md`, read from the base branch.
 
 ## Verification and delivery
 
