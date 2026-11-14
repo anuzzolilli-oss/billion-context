@@ -120,6 +120,8 @@ export const LIVE_FILES = [
     "tests/mcp-eof.test.ts",
     // #69: spawns real process trees to exercise the CI stall watch; no ports.
     "tests/ci-stall-watch.test.ts",
+    // #69: runs copies of run-ci-tests.mjs as subprocesses; no ports.
+    "tests/ci-runner-stall-gate.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

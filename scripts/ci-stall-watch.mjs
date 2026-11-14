@@ -123,8 +123,11 @@ export function killProcessTree(rootPid, known = []) {
         }
         return;
     }
-    const pids = known.length > 0 ? known.map((p) => p.pid).reverse() : [rootPid];
-    if (!pids.includes(rootPid)) pids.push(rootPid);
+    // runWatched starts the phase as the leader of its own process group, so
+    // the group kill reaches every descendant without needing the snapshot
+    // (`ps` can be missing or time out). Snapshot pids follow for anything
+    // that moved itself into another group.
+    const pids = [-rootPid, ...known.map((p) => p.pid).reverse(), rootPid];
     for (const pid of pids) {
         try {
             process.kill(pid, "SIGKILL");
@@ -161,7 +164,20 @@ export function runWatched(command, args, opts = {}) {
     } = opts;
     const t0 = Date.now();
     return new Promise((resolve) => {
-        const child = spawn(command, args, { cwd, env });
+        // POSIX: own process group, so killProcessTree can end the whole tree
+        // by group. Windows needs nothing here (taskkill /T walks the tree).
+        const posix = process.platform !== "win32";
+        const child = spawn(command, args, { cwd, env, detached: posix });
+        // A group leader no longer receives the terminal's or the CI agent's
+        // signal with us: pass it on, then end the way the signal would have.
+        const onSignal = (sig) => {
+            killTree(child.pid, []);
+            process.exit(sig === "SIGINT" ? 130 : 143);
+        };
+        if (posix) {
+            process.once("SIGINT", onSignal);
+            process.once("SIGTERM", onSignal);
+        }
         let stalled = false;
         let settled = false;
         let graceTimer;
@@ -171,6 +187,8 @@ export function runWatched(command, args, opts = {}) {
             settled = true;
             clearTimeout(stallTimer);
             clearTimeout(graceTimer);
+            process.removeListener("SIGINT", onSignal);
+            process.removeListener("SIGTERM", onSignal);
             resolve({ spawnError: undefined, ...r, stalled, ms: Date.now() - t0 });
         };
         const onStall = () => {

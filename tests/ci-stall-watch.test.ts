@@ -5,7 +5,7 @@
 // what happens to a process tree, which a stub cannot show.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -19,9 +19,30 @@ const STALL_AFTER_MS = 3000;
 function alive(pid: number): boolean {
     try {
         process.kill(pid, 0);
-        return true;
     } catch {
         return false;
+    }
+    if (process.platform === "linux") {
+        // kill(pid, 0) also succeeds for a zombie: a killed process nobody has
+        // reaped yet (a container whose PID 1 does not reap). It is not running.
+        try {
+            const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+            if (stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3) === "Z") return false;
+        } catch {
+            return false;
+        }
+    }
+    return true;
+}
+
+/** Teardown kill. Never signals pid 0 or below: on POSIX that addresses a
+ *  whole process group, which would take the test runner with it. */
+function killQuietly(pid: number): void {
+    if (!Number.isInteger(pid) || pid <= 0) return;
+    try {
+        process.kill(pid, "SIGKILL");
+    } catch {
+        // already gone — the expected case
     }
 }
 
@@ -77,15 +98,7 @@ test("a silent phase is reported, killed as a tree and flagged stalled", async (
         log: (l) => logs.push(l),
     });
     const [rootPid, kidPid] = pidsFrom(out);
-    t.after(() => {
-        for (const pid of [kidPid, rootPid]) {
-            try {
-                process.kill(pid, "SIGKILL");
-            } catch {
-                // already gone — the expected case
-            }
-        }
-    });
+    t.after(() => [kidPid, rootPid].forEach(killQuietly));
     const report = logs.join("\n");
 
     assert.equal(r.stalled, true, "flagged stalled");
@@ -171,37 +184,20 @@ test("a failed process snapshot is reported and the phase is still killed and fl
         },
     });
     const pids = pidsFrom(out);
-    t.after(() => {
-        for (const pid of pids) {
-            try {
-                process.kill(pid, "SIGKILL");
-            } catch {
-                // already gone
-            }
-        }
-    });
+    t.after(() => pids.forEach(killQuietly));
     const report = logs.join("\n");
     assert.equal(r.stalled, true);
     assert.match(report, /process snapshot unavailable \(query refused\) — killing anyway/);
     assert.doesNotMatch(report, /still running:/, "claims nothing about what was running");
-    if (process.platform === "win32") {
-        // taskkill /T does not need the snapshot.
-        assert.deepEqual(await waitDead(pids), [], "whole tree ended without a snapshot");
-    } else {
-        assert.equal(alive(pids[0]), false, "the phase root ended without a snapshot");
-    }
+    // taskkill /T on Windows and the process-group kill elsewhere: neither
+    // needs the snapshot.
+    assert.deepEqual(await waitDead(pids), [], "whole tree ended without a snapshot");
 });
 
 test("a phase whose streams stay open after the kill is abandoned after the grace, still flagged stalled", async (t) => {
     const logs: string[] = [];
     let pid = 0;
-    t.after(() => {
-        try {
-            process.kill(pid, "SIGKILL");
-        } catch {
-            // already gone
-        }
-    });
+    t.after(() => killQuietly(pid));
     const r = await runWatched(process.execPath, ["-e", "console.log(process.pid); setInterval(() => {}, 1000)"], {
         limitMs: STALL_AFTER_MS,
         closeGraceMs: 500,
