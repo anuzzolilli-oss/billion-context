@@ -1,14 +1,14 @@
-export interface ProcRow {
+interface ProcRow {
     pid: number;
     ppid: number;
     cmd: string;
 }
 
-export interface ProcNode extends ProcRow {
+interface ProcNode extends ProcRow {
     depth: number;
 }
 
-export interface WatchedResult {
+interface WatchedResult {
     code: number | null;
     signal: NodeJS.Signals | null;
     stalled: boolean;
@@ -16,7 +16,7 @@ export interface WatchedResult {
     spawnError: Error | undefined;
 }
 
-export interface WatchOptions {
+interface WatchOptions {
     cwd?: string;
     env?: NodeJS.ProcessEnv;
     label?: string;
@@ -32,6 +32,7 @@ export interface WatchOptions {
 export const STALL_LIMIT_MS: number;
 export function listProcesses(): ProcRow[];
 export function descendantsOf(rootPid: number, rows: ProcRow[]): ProcNode[];
+export function orphansRunning(execPath: string, rows: ProcRow[]): ProcRow[];
 export function testFilesIn(procs: ProcNode[]): string[];
 export function killProcessTree(rootPid: number, known?: ProcNode[]): void;
 export function runWatched(command: string, args: string[], opts?: WatchOptions): Promise<WatchedResult>;

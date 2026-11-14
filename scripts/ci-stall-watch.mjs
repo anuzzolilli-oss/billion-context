@@ -5,8 +5,10 @@
 //
 // runWatched() spawns a phase and, when it prints nothing on stdout AND stderr
 // for `limitMs`, (1) reports the processes still alive under it — a finished
-// test file's process is gone, so what remains is what is stuck — (2) ends the
-// whole process tree, and (3) resolves with `stalled: true`. The caller fails
+// test file's process is gone, so what remains is usually what is stuck — plus
+// node processes whose parent has exited, (2) ends the phase's process tree,
+// and (3) resolves with `stalled: true`. Limit: a process orphaned by a test
+// file that already exited is outside the tree; it is listed, not killed. The caller fails
 // the job; a stall is never retried here (owner decision on #69: the stall
 // stays a red job while its cause is unknown).
 //
@@ -79,6 +81,18 @@ export function descendantsOf(rootPid, rows) {
     if (root) out.push({ ...root, depth: 0 });
     walk(rootPid, 1);
     return out;
+}
+
+/** Processes whose parent is gone and whose command line runs `execPath`.
+ *  A test file that exits while something it started still holds its output
+ *  leaves exactly this: the phase stays silent, but the holder is no longer
+ *  under the phase's tree (Windows keeps the dead parent's pid on it), so
+ *  descendantsOf() cannot see it. Listed as a hint only — nothing proves these
+ *  belong to this phase, so they are never killed. Pure. */
+export function orphansRunning(execPath, rows) {
+    const live = new Set(rows.map((r) => r.pid));
+    const needle = execPath.toLowerCase();
+    return rows.filter((r) => r.ppid > 0 && !live.has(r.ppid) && r.cmd.toLowerCase().includes(needle));
 }
 
 /** Test files named on the command lines of the given processes. Pure. */
@@ -168,7 +182,8 @@ export function runWatched(command, args, opts = {}) {
             );
             let procs = [];
             try {
-                procs = descendantsOf(child.pid, list());
+                const rows = list();
+                procs = descendantsOf(child.pid, rows);
                 log(`[ci-tests] STALL: ${procs.length} process(es) still alive under ${label} (pid ${child.pid}), taken before the kill:`);
                 for (const p of procs) log(`[ci-tests] STALL:   ${"  ".repeat(p.depth)}pid=${p.pid} ppid=${p.ppid} ${tailOf(p.cmd)}`);
                 const files = testFilesIn(procs);
@@ -177,6 +192,14 @@ export function runWatched(command, args, opts = {}) {
                         ? `[ci-tests] STALL: test file(s) still running: ${files.join(", ")}`
                         : `[ci-tests] STALL: no test file could be read from the command lines above`,
                 );
+                const orphans = orphansRunning(process.execPath, rows);
+                if (orphans.length > 0) {
+                    log(
+                        `[ci-tests] STALL: ${orphans.length} node process(es) on this machine have no living parent — possibly left by a ` +
+                            `test file that already exited and still holding its output; NOT killed, not proven to be this phase's:`,
+                    );
+                    for (const p of orphans) log(`[ci-tests] STALL:   pid=${p.pid} ppid=${p.ppid} (gone) ${tailOf(p.cmd)}`);
+                }
             } catch (e) {
                 procs = [];
                 log(`[ci-tests] STALL: process snapshot unavailable (${e && e.message ? e.message.split("\n")[0] : e}) — killing anyway`);

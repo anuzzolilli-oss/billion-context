@@ -9,7 +9,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { descendantsOf, runWatched, STALL_LIMIT_MS, testFilesIn } from "../scripts/ci-stall-watch.mjs";
+import { descendantsOf, orphansRunning, runWatched, STALL_LIMIT_MS, testFilesIn } from "../scripts/ci-stall-watch.mjs";
 
 // Short stand-in for the 10-minute limit. It also has to cover a fixture's
 // start-up (spawn + node boot) on a loaded runner, since nothing is printed
@@ -235,6 +235,22 @@ test("descendantsOf walks only the phase's own tree, parents first", () => {
     );
     assert.deepEqual(testFilesIn(tree), ["tests/a.test.ts"], "the root's file list and other trees name nothing");
     assert.deepEqual(descendantsOf(999, rows), [], "an unknown root has no tree");
+});
+
+test("orphansRunning lists node processes whose parent is gone, and only those", () => {
+    const rows = [
+        { pid: 10, ppid: 1, cmd: '"C:\\Node\\node.exe" --test tests/a.test.ts' },
+        { pid: 11, ppid: 10, cmd: '"C:\\Node\\node.exe" tests/a.test.ts' },
+        { pid: 30, ppid: 777, cmd: '"c:\\node\\NODE.EXE" dist/index.js start' },
+        { pid: 31, ppid: 778, cmd: "C:\\Windows\\explorer.exe" },
+        { pid: 1, ppid: 0, cmd: "System" },
+    ];
+    assert.deepEqual(
+        orphansRunning("C:\\Node\\node.exe", rows).map((r) => r.pid),
+        [30],
+        "living parent, other executables and the system root are left out",
+    );
+    assert.deepEqual(orphansRunning("C:\\Node\\node.exe", rows.filter((r) => r.pid !== 30)), []);
 });
 
 test("testFilesIn normalises Windows separators and skips ambiguous command lines", () => {
