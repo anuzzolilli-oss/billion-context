@@ -134,7 +134,7 @@ for (const blockedAt of ["activate", "ensure"] as const) {
         const exits: number[] = [];
         let routes = 0;
         const state = { origin: OLD, failures: 2, policy: defaultZcodeRoutePolicy() };
-        await routeZcodeConfig({ origin: OLD, dataDir: dir, log: () => {} });
+        await routeZcodeConfig({ origin: OLD, dataDir: dir, env: {}, log: () => {} });
         const stop = entry.startWatchdog(state, false, () => {}, {
             intervalMs: 1,
             probe: async () => false,
@@ -142,7 +142,7 @@ for (const blockedAt of ["activate", "ensure"] as const) {
                 if (blockedAt === "ensure") { entered.resolve(); await blocked.promise; }
                 return { origin: NEW };
             },
-            route: async (opts) => { routes++; return routeZcodeConfig({ ...opts, dataDir: dir, log: () => {} }); },
+            route: async (opts) => { routes++; return routeZcodeConfig({ ...opts, dataDir: dir, env: {}, log: () => {} }); },
             activate: async () => {
                 if (blockedAt === "activate") { entered.resolve(); await blocked.promise; }
             },
@@ -150,22 +150,35 @@ for (const blockedAt of ["activate", "ensure"] as const) {
         });
         entry.installExitHandoff(state, () => {}, {
             events: emitter,
-            handoff: (ownOrigin) => handoffZcodeRoutingOnExit({ ownOrigin, dataDir: dir, log: () => {}, findReplacement: async () => undefined }),
+            handoff: (ownOrigin) => handoffZcodeRoutingOnExit({ ownOrigin, dataDir: dir, env: {}, log: () => {}, findReplacement: async () => undefined }),
             exit: (code) => { exits.push(code); exited.resolve(); },
         });
         const hold = setTimeout(() => {}, 5000);
         try {
             await entered.promise;
-            assert.equal(detectCurrentZcodeOrigin(dir), blockedAt === "activate" ? NEW : OLD);
+            assert.equal(detectCurrentZcodeOrigin(dir, {}), blockedAt === "activate" ? NEW : OLD);
             emitter.emit("SIGTERM");
             await exited.promise;
             assert.deepEqual(exits, [143]);
-            assert.equal(detectCurrentZcodeOrigin(dir), undefined);
+            assert.equal(detectCurrentZcodeOrigin(dir, {}), undefined);
             blocked.resolve();
             await stop();
-            assert.equal(detectCurrentZcodeOrigin(dir), undefined);
+            assert.equal(detectCurrentZcodeOrigin(dir, {}), undefined);
             assert.equal(routes, blockedAt === "activate" ? 1 : 0);
         } finally { clearTimeout(hold); blocked.resolve(); await stop(); rmrf(dir); }
+    });
+}
+
+for (const first of ["reverted-direct", "not-ours"] as const) {
+    test(`exit handoff tries the in-flight routing origin only when the adopted origin is not the owner (first=${first})`, async () => {
+        const asked: string[] = [];
+        const handoff = entry.installExitHandoff({ origin: OLD, routing: NEW }, () => {}, {
+            events: new EventEmitter(),
+            handoff: async (ownOrigin) => { asked.push(ownOrigin); return ownOrigin === OLD ? first : "reverted-direct"; },
+            exit: () => { assert.fail("EOF must not force exit"); },
+        });
+        await handoff();
+        assert.deepEqual(asked, first === "not-ours" ? [OLD, NEW] : [OLD]);
     });
 }
 
