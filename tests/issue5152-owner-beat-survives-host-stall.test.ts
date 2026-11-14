@@ -178,8 +178,10 @@ test("#5152 one worker per origin: repeated attach paths share, refcounted stop"
         const t2 = recv.beats().length;
         const w2 = Date.now();
         await wait(1_000);
-        const rateAfterOne = (recv.beats().length - t2) / ((Date.now() - w2) / 1000);
-        assert.ok(rateAfterOne >= 5, `the first stop() must not silence a still-attached caller: ${rateAfterOne.toFixed(1)}/s`);
+        const windowMs = Date.now() - w2;
+        const beats = recv.beats();
+        const rateAfterOne = (beats.length - t2) / (windowMs / 1000);
+        assert.ok(rateAfterOne >= 5, `the first stop() must not silence a still-attached caller: ${rateAfterOne.toFixed(1)}/s (${beats.length - t2} beats in ${windowMs}ms; rate before the stop ${rateBoth.toFixed(1)}/s; receiver-clock ms of the last beats: ${beats.slice(-25).join(",")})`);
     } finally {
         s1?.();
         s2?.();
