@@ -1,6 +1,6 @@
 # 文档导航
 
-**billion-context** 的全部系统文档都集中在这个目录。仓库根目录只保留四个入口文件：`README.md`、`README.zh-CN.md`、`AGENTS.md`、`CHANGELOG.md`（原根路径保留单行重定向占位，记账见 [lifecycle §5](lifecycle.md#5-卫生记录)）。
+**billion-context** 的全部系统文档都集中在这个目录。仓库根目录只保留四个入口文件：`README.md`、`README.zh-CN.md`、`AGENTS.md`、`CHANGELOG.md`（原根路径保留单行重定向占位，记账见 [lifecycle §5](lifecycle.md#5-卫生记录)）。唯一例外：`REVIEW.md`（自动 PR 评审器的评审策略文件）也保留在根目录，因为评审器只从根目录读取它；它属于工具配置，不是系统文档。
 
 > **全量目录：** [index.zh-CN.md](index.zh-CN.md) / [index.md](index.md) —— 每篇文档一行说明。本页是目录落地页：东西在哪、什么规则让它们保持新鲜。
 
