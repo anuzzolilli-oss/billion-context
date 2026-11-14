@@ -112,8 +112,22 @@ function runToClose(command: string, args: string[], opts: RunOptions): Promise<
             settled = true;
             clearTimeout(deadline);
             clearTimeout(fallback);
+            for (const [sig, h] of onSignal) process.removeListener(sig, h);
             fn();
         };
+        // The child is outside the caller's process group on POSIX, so a
+        // cancelled run (Ctrl+C on a targeted run) must take it down itself.
+        const onSignal = new Map<NodeJS.Signals, () => void>();
+        if (process.platform !== "win32") {
+            for (const [sig, exitCode] of [["SIGINT", 130], ["SIGTERM", 143]] as const) {
+                const h = () => {
+                    if (child.pid !== undefined) killTree(child.pid);
+                    process.exit(exitCode);
+                };
+                onSignal.set(sig, h);
+                process.once(sig, h);
+            }
+        }
         const timeoutError = (how: string) => new Error(`command did not finish in ${timeoutMs}ms (${how}). Output so far:\n${out}`);
         const deadline = setTimeout(() => {
             timedOut = true;
@@ -286,18 +300,23 @@ test("the deadline kills the whole tree, including a child holding the output pi
 test("a pipe holder that survives the kill cannot keep the wait open", async (t) => {
     const { dir, script } = pipeHolder();
     let pids: number[] = [];
+    // Known from the kill callback, not from the fixture's output: teardown
+    // must reach the tree even if the pids were never printed.
+    let root = 0;
     t.after(async () => {
+        if (root > 0) killTree(root);
         for (const pid of pids) if (pid > 0) killProcessTree(pid);
         await waitDead(pids);
         rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     });
     const t0 = Date.now();
     // A kill that reaches nothing: both processes keep the pipes open.
-    const err = await runToClose(process.execPath, [script], { cwd: dir, timeoutMs: 2000, graceMs: 1500, kill: () => {} }).then(
+    const err = await runToClose(process.execPath, [script], { cwd: dir, timeoutMs: 2000, graceMs: 1500, kill: (pid) => void (root = pid) }).then(
         () => undefined,
         (e: Error) => e,
     );
     assert.ok(err, "the wait ends even though 'close' never came");
+    assert.ok(root > 0, "the deadline handed the root pid to the kill");
     pids = pidsIn(err.message);
     assert.match(err.message, /output pipes still open 1500ms after the kill; abandoned/);
     assert.ok(Date.now() - t0 < 20_000, "bounded by deadline plus grace");
