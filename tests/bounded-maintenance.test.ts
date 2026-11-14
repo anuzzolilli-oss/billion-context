@@ -100,7 +100,9 @@ async function scenario(enabled: boolean, mode = "success") {
         passthrough: false, autoUpdate: false, advisoryCheck: false, releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     };
-    const proxy = await startServer(opts, enabled ? { boundedMaintenance: { timeoutMs: mode === "timeout" || retryMode ? 25 : 15000 } } : undefined);
+    // Held by reference: the deadline is read from this object at each launch.
+    const maintenancePolicy = { timeoutMs: mode === "timeout" || retryMode ? 25 : 15000 };
+    const proxy = await startServer(opts, enabled ? { boundedMaintenance: maintenancePolicy } : undefined);
     await once(proxy, "listening");
     if (mode === "shutdown-relisten") {
         await new Promise<void>(r => proxy.close(() => r()));
@@ -198,6 +200,12 @@ async function scenario(enabled: boolean, mode = "success") {
             assert.deepEqual([retryState()?.pending, retryState()?.attempts], [true, 1], "the failed first attempt is collected");
             await send(messages);
             assert.equal(maintenance, 1, "No retry during cooldown");
+            assert.equal((getSession(headers["x-bili-plugin-conversation"]).metadata.boundedMaintenanceLast as { failureKind?: string } | undefined)?.failureKind, "deadline", "the first attempt ended at its 25 ms deadline");
+            // The deadline is a real timer; only Date.now is mocked. The retry
+            // that the fake upstream answers must not race 25 real ms on a
+            // loaded machine, so it gets the default deadline. retry-cap keeps
+            // 25 ms: none of its attempts is answered.
+            if (mode !== "retry-cap") maintenancePolicy.timeoutMs = 15000;
             elapsed += 30001;
             if (mode === "retry-changed") messages[3] = { role: "assistant", content: "CHANGED ARCHIVE " + "replacement facts ".repeat(1300) };
             await Promise.all([send(messages), send(messages)]);
