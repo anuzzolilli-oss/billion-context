@@ -52,6 +52,9 @@ export interface MutableZcodeWatchdogState extends ZcodeWatchdogState {
     origin: string;
     failures: number;
     stopped?: boolean;
+    /** Origin a replacement tick has started routing the store to but has not
+     *  adopted as `origin` yet; the exit handoff owns that route too (#14). */
+    routing?: string;
 }
 
 function buildEnsureOpts(): Parameters<typeof ensureProxyRunning>[0] {
@@ -94,7 +97,12 @@ export async function zcodeWatchdogTick(state: MutableZcodeWatchdogState, extern
         } else {
             const ensure = deps.ensure ?? defaultEnsure;
             const { origin } = await ensure(buildEnsureOpts());
-            if (origin !== state.origin) {
+            if (origin === state.origin) {
+                log(`proxy ${origin} recovered without a re-route`);
+            } else if (state.stopped) {
+                log(`proxy respawned at ${origin} during shutdown — routing left to the exit handoff`);
+            } else {
+                state.routing = origin;
                 process.env.BILI_MCP_PROXY = origin;
                 const route = deps.route ?? routeZcodeConfig;
                 const routed = await route({ origin, log, policy: state.policy });
@@ -102,9 +110,8 @@ export async function zcodeWatchdogTick(state: MutableZcodeWatchdogState, extern
                 const activate = deps.activate ?? activateZcodePluginMode;
                 await activate(routed, { log });
                 state.origin = origin;
+                state.routing = undefined;
                 log(`proxy respawned at ${origin} — config re-routed`);
-            } else {
-                log(`proxy ${origin} recovered without a re-route`);
             }
             state.failures = 0;
         }
@@ -129,16 +136,24 @@ export function startWatchdog(
     return async () => { state.stopped = true; clearInterval(timer); await pending; };
 }
 
-export function installExitHandoff(state: { origin: string }, log: (msg: string) => void, deps: {
+export function installExitHandoff(state: { origin: string; routing?: string; stopped?: boolean }, log: (msg: string) => void, deps: {
     events?: { once(event: string, listener: () => void): unknown };
-    handoff?: () => Promise<unknown>;
+    handoff?: (ownOrigin: string) => Promise<unknown>;
     exit?: (code: number) => void;
     timeoutMs?: number;
 } = {}): () => Promise<void> {
     let pending: Promise<void> | undefined;
     const finish = () => pending ??= (async () => {
+        state.stopped = true;
         try {
-            await (deps.handoff ? deps.handoff() : handoffZcodeRoutingOnExit({ ownOrigin: state.origin, log }));
+            const tried = new Set<string>();
+            for (;;) {
+                const ownOrigin = [state.origin, state.routing].find((o): o is string => o !== undefined && !tried.has(o));
+                if (ownOrigin === undefined) break;
+                tried.add(ownOrigin);
+                const outcome = await (deps.handoff ? deps.handoff(ownOrigin) : handoffZcodeRoutingOnExit({ ownOrigin, log }));
+                if (outcome !== "not-ours") break;
+            }
         } catch (err) {
             log(`exit handoff failed: ${err instanceof Error ? err.message : String(err)}`);
         } finally {
