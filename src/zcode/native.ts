@@ -592,9 +592,15 @@ export async function handoffZcodeRoutingOnExit(opts: ExitHandoffOptions): Promi
     const env = opts.env ?? process.env;
     const log = opts.log ?? defaultLog;
     const dataDir = opts.dataDir ?? resolveZcodeDataDir(env);
-    const current = detectCurrentZcodeOrigin(dataDir, env);
-    if (!current || current !== opts.ownOrigin) return "not-ours";
+    const stillOurs = () => detectCurrentZcodeOrigin(dataDir, env) === opts.ownOrigin;
+    if (!stillOurs()) return "not-ours";
     const replacement = await (opts.findReplacement ?? defaultFindReplacement)();
+    // Replacement discovery awaits; another process may have taken the shared
+    // route meanwhile, and its route must not be overwritten or removed.
+    if (!stillOurs()) {
+        log("exit handoff: the store changed owner during replacement discovery — leaving it untouched");
+        return "not-ours";
+    }
     if (replacement) {
         const routed = await routeZcodeConfig({ origin: replacement.origin, env, dataDir: opts.dataDir, log, policy: zcodePolicyFromEnv(env) });
         if (routed) {
@@ -602,6 +608,7 @@ export async function handoffZcodeRoutingOnExit(opts: ExitHandoffOptions): Promi
             log(`exit handoff: store → ${replacement.origin}`);
             return "handed-off";
         }
+        if (!stillOurs()) return "not-ours";
     }
     unrouteZcode({ env, dataDir: opts.dataDir, log });
     log("exit handoff: store reverted to direct upstream");

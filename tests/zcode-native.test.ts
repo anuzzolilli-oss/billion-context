@@ -710,6 +710,34 @@ test("handoffZcodeRoutingOnExit reverts to direct when no replacement lives (#16
     }
 });
 
+for (const replacementFound of [false, true]) {
+    test(`handoffZcodeRoutingOnExit leaves a route another owner took during replacement discovery (replacement=${replacementFound})`, async () => {
+        const dir = dataDir();
+        const newOwner = "http://127.0.0.1:38787";
+        try {
+            await routeZcodeConfig({ origin: "http://127.0.0.1:18787", dataDir: dir, log: NO_LOG });
+            let taken = "";
+            assert.equal(
+                await handoffZcodeRoutingOnExit({
+                    ownOrigin: "http://127.0.0.1:18787",
+                    dataDir: dir,
+                    log: NO_LOG,
+                    findReplacement: async () => {
+                        await routeZcodeConfig({ origin: newOwner, dataDir: dir, log: NO_LOG });
+                        taken = readFileSync(storeFile(dir), "utf8");
+                        return replacementFound ? { origin: "http://127.0.0.1:28787" } : undefined;
+                    },
+                }),
+                "not-ours",
+            );
+            assert.equal(detectCurrentZcodeOrigin(dir), newOwner);
+            assert.equal(readFileSync(storeFile(dir), "utf8"), taken);
+        } finally {
+            rmrf(dir);
+        }
+    });
+}
+
 // #1892: the zero-wrapped path must explain itself instead of leaving the
 // client a bare "Connection closed". An empty personal store is NOT "no
 // provider" — this build sources active providers from the built-in/account
