@@ -84,6 +84,27 @@ The `static-gates` job (same os×node matrix) runs typecheck + kernel suite +
 pi-subagents suite + build IN PARALLEL with the `test` job; they used to be
 sequential steps ahead of the tests (~90s of critical path per leg).
 
+## CI: stall watch (#69)
+
+Every phase `scripts/run-ci-tests.mjs` starts (the main run, the full retry and
+the isolated re-runs) runs under `scripts/ci-stall-watch.mjs`. A phase that
+prints nothing on stdout and stderr for 10 minutes is treated as stalled: the
+runner lists the processes still alive under it (a finished test file's process
+is gone, so the list usually names the stuck file and what it started), kills
+that process tree, and fails the job. A stall is never retried and never
+reaches the failure-shape classifier — it stays a red job until its cause is
+known. `node --test` holds back later files' output until the file at the head
+of its order finishes, which is why one hung file used to silence a whole shard
+until the 90-minute job timeout (#61).
+
+The limit is a constant, not a setting. It was chosen against the longest quiet
+gap seen in 20 passing windows-latest / Node 24 shard jobs on 2026-11-14
+(238.5 s). A hang that keeps printing is not detected. A process left behind by
+a test file that has already exited is outside the phase's tree: the report
+lists node processes with no living parent as a hint, names no file in that
+case, and does not kill them. When a job fails with
+`STALL:` lines, copy the process list to the issue tracking that stall.
+
 ## Hermetic data roots (#5107)
 
 Running the suite on a machine that also has bili installed must never touch
