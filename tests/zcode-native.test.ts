@@ -650,6 +650,137 @@ test("repairSharedStoreDrift reverts to direct when nothing live remains (#1623)
     }
 });
 
+// #63: the repair reads the store's owner once, then awaits health probes and
+// replacement discovery. A route another process writes during those awaits
+// must survive all three of the repair's writes: re-point to self, re-point to
+// a replacement, revert to direct. The positive cases above are the controls.
+
+const DRIFT_DEAD = "http://127.0.0.1:18787";
+const DRIFT_SELF = "http://127.0.0.1:28787";
+const DRIFT_REPLACEMENT = "http://127.0.0.1:48787";
+const DRIFT_NEW_OWNER = "http://127.0.0.1:38787";
+
+type DriftPath = "self" | "replacement" | "revert";
+
+/** Runs the repair down one write path; `during` runs inside the last await
+ *  before that path's write. Nothing is listening anywhere: liveness is
+ *  entirely the probe seam's answer. */
+function repairDownPath(dir: string, writePath: DriftPath, during: () => void | Promise<void>, logs: string[] = []) {
+    return repairSharedStoreDrift({
+        selfOrigin: DRIFT_SELF,
+        dataDir: dir,
+        env: {},
+        log: (m) => logs.push(m),
+        probe: async (origin) => {
+            if (origin !== DRIFT_SELF) return false;
+            if (writePath !== "self") return false;
+            await during();
+            return true;
+        },
+        findReplacement: async () => {
+            await during();
+            return writePath === "replacement" ? { origin: DRIFT_REPLACEMENT } : undefined;
+        },
+    });
+}
+
+for (const writePath of ["self", "replacement", "revert"] as const) {
+    test(`repairSharedStoreDrift leaves a route another owner took during its awaits (write path: ${writePath}) (#63)`, async () => {
+        const dir = dataDir();
+        try {
+            await routeZcodeConfig({ origin: DRIFT_DEAD, dataDir: dir, env: {}, log: NO_LOG });
+            let taken = "";
+            const logs: string[] = [];
+            const outcome = await repairDownPath(
+                dir,
+                writePath,
+                async () => {
+                    await routeZcodeConfig({ origin: DRIFT_NEW_OWNER, dataDir: dir, env: {}, log: NO_LOG });
+                    taken = readFileSync(storeFile(dir), "utf8");
+                },
+                logs,
+            );
+            assert.equal(outcome, "owner-changed");
+            assert.equal(detectCurrentZcodeOrigin(dir, {}), DRIFT_NEW_OWNER);
+            assert.equal(readFileSync(storeFile(dir), "utf8"), taken, "the new owner's store is byte-identical");
+            assert.ok(logs.some((m) => /no longer points at/.test(m)), "the repair says why it stood down");
+            assert.ok(!logs.some((m) => /store repaired|reverted to direct/.test(m)), "and claims no repair");
+        } finally {
+            rmrf(dir);
+        }
+    });
+
+    test(`control: repairSharedStoreDrift still writes when nothing changed during its awaits (write path: ${writePath}) (#63)`, async () => {
+        const dir = dataDir();
+        try {
+            await routeZcodeConfig({ origin: DRIFT_DEAD, dataDir: dir, env: {}, log: NO_LOG });
+            const outcome = await repairDownPath(dir, writePath, () => {});
+            if (writePath === "self") {
+                assert.equal(outcome, "repointed-self");
+                assert.equal(detectCurrentZcodeOrigin(dir, {}), DRIFT_SELF);
+            } else if (writePath === "replacement") {
+                assert.equal(outcome, "repointed-replacement");
+                assert.equal(detectCurrentZcodeOrigin(dir, {}), DRIFT_REPLACEMENT);
+            } else {
+                assert.equal(outcome, "reverted-direct");
+                assert.doesNotMatch(readFileSync(storeFile(dir), "utf8"), /\/bili\//);
+            }
+        } finally {
+            rmrf(dir);
+        }
+    });
+}
+
+for (const writePath of ["self", "replacement"] as const) {
+    test(`repairSharedStoreDrift leaves a store that went direct during its awaits (write path: ${writePath}) (#63)`, async () => {
+        const dir = dataDir();
+        try {
+            await routeZcodeConfig({ origin: DRIFT_DEAD, dataDir: dir, env: {}, log: NO_LOG });
+            let direct = "";
+            const outcome = await repairDownPath(dir, writePath, () => {
+                unrouteZcode({ dataDir: dir, env: {}, log: NO_LOG });
+                direct = readFileSync(storeFile(dir), "utf8");
+            });
+            assert.equal(outcome, "owner-changed");
+            assert.doesNotMatch(direct, /\/bili\//);
+            assert.equal(readFileSync(storeFile(dir), "utf8"), direct, "a store reverted to direct is not re-wrapped");
+        } finally {
+            rmrf(dir);
+        }
+    });
+
+    // The check has to sit inside the locked write: here the store still
+    // points at the dead origin when the route call starts, and changes owner
+    // only while that call is waiting for the config lock.
+    test(`repairSharedStoreDrift leaves a route taken while it waited for the config lock (write path: ${writePath}) (#63)`, async () => {
+        const dir = dataDir();
+        const lockDir = path.join(dir, "v2", ".bili-config.lock");
+        try {
+            await routeZcodeConfig({ origin: DRIFT_DEAD, dataDir: dir, env: {}, log: NO_LOG });
+            let taken = "";
+            let heldWhenTaken = false;
+            const outcome = await repairDownPath(dir, writePath, () => {
+                // Another live process holds the lock, writes its route, releases.
+                mkdirSync(lockDir);
+                writeFileSync(path.join(lockDir, "pid"), String(process.pid));
+                setTimeout(() => {
+                    heldWhenTaken = existsSync(lockDir);
+                    taken = readFileSync(storeFile(dir), "utf8").split(DRIFT_DEAD).join(DRIFT_NEW_OWNER);
+                    writeFileSync(storeFile(dir), taken);
+                    rmrf(lockDir);
+                }, 400);
+            });
+            assert.ok(heldWhenTaken, "the route changed while the lock was held by the other writer");
+            assert.equal(outcome, "owner-changed");
+            assert.equal(detectCurrentZcodeOrigin(dir, {}), DRIFT_NEW_OWNER);
+            assert.equal(readFileSync(storeFile(dir), "utf8"), taken);
+            assert.ok(!existsSync(lockDir), "the repair released the lock it took");
+        } finally {
+            rmrf(dir);
+        }
+    });
+}
+
 test("handoffZcodeRoutingOnExit leaves a foreign pointer untouched (#1623)", async () => {
     const dir = dataDir();
     try {
