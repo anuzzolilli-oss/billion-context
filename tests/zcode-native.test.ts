@@ -656,42 +656,51 @@ test("repairSharedStoreDrift reverts to direct when nothing live remains (#1623)
 // a replacement, revert to direct. The positive cases above are the controls.
 
 const DRIFT_DEAD = "http://127.0.0.1:18787";
-const DRIFT_SELF = "http://127.0.0.1:28787";
-const DRIFT_REPLACEMENT = "http://127.0.0.1:48787";
 const DRIFT_NEW_OWNER = "http://127.0.0.1:38787";
 
 type DriftPath = "self" | "replacement" | "revert";
+interface DriftOrigins {
+    readonly self: string;
+    readonly replacement: string;
+}
+
+/** A successful repair reports runtime info to the origin it routed to, so the
+ *  two possible destinations are servers this test owns, on allocated ports.
+ *  The dead origin and the new owner are never contacted. */
+function withDriftOrigins<T>(fn: (origins: DriftOrigins) => Promise<T>): Promise<T> {
+    return withHealthServer((self) => withHealthServer((replacement) => fn({ self, replacement })));
+}
 
 /** Runs the repair down one write path; `during` runs inside the last await
- *  before that path's write. Nothing is listening anywhere: liveness is
- *  entirely the probe seam's answer. */
-function repairDownPath(dir: string, writePath: DriftPath, during: () => void | Promise<void>, logs: string[] = []) {
+ *  before that path's write. Liveness is entirely the probe seam's answer. */
+function repairDownPath(o: DriftOrigins, dir: string, writePath: DriftPath, during: () => void | Promise<void>, logs: string[] = []) {
     return repairSharedStoreDrift({
-        selfOrigin: DRIFT_SELF,
+        selfOrigin: o.self,
         dataDir: dir,
         env: {},
         log: (m) => logs.push(m),
         probe: async (origin) => {
-            if (origin !== DRIFT_SELF) return false;
+            if (origin !== o.self) return false;
             if (writePath !== "self") return false;
             await during();
             return true;
         },
         findReplacement: async () => {
             await during();
-            return writePath === "replacement" ? { origin: DRIFT_REPLACEMENT } : undefined;
+            return writePath === "replacement" ? { origin: o.replacement } : undefined;
         },
     });
 }
 
 for (const writePath of ["self", "replacement", "revert"] as const) {
-    test(`repairSharedStoreDrift leaves a route another owner took during its awaits (write path: ${writePath}) (#63)`, async () => {
+    test(`repairSharedStoreDrift leaves a route another owner took during its awaits (write path: ${writePath}) (#63)`, () => withDriftOrigins(async (o) => {
         const dir = dataDir();
         try {
             await routeZcodeConfig({ origin: DRIFT_DEAD, dataDir: dir, env: {}, log: NO_LOG });
             let taken = "";
             const logs: string[] = [];
             const outcome = await repairDownPath(
+                o,
                 dir,
                 writePath,
                 async () => {
@@ -708,19 +717,19 @@ for (const writePath of ["self", "replacement", "revert"] as const) {
         } finally {
             rmrf(dir);
         }
-    });
+    }));
 
-    test(`control: repairSharedStoreDrift still writes when nothing changed during its awaits (write path: ${writePath}) (#63)`, async () => {
+    test(`control: repairSharedStoreDrift still writes when nothing changed during its awaits (write path: ${writePath}) (#63)`, () => withDriftOrigins(async (o) => {
         const dir = dataDir();
         try {
             await routeZcodeConfig({ origin: DRIFT_DEAD, dataDir: dir, env: {}, log: NO_LOG });
-            const outcome = await repairDownPath(dir, writePath, () => {});
+            const outcome = await repairDownPath(o, dir, writePath, () => {});
             if (writePath === "self") {
                 assert.equal(outcome, "repointed-self");
-                assert.equal(detectCurrentZcodeOrigin(dir, {}), DRIFT_SELF);
+                assert.equal(detectCurrentZcodeOrigin(dir, {}), o.self);
             } else if (writePath === "replacement") {
                 assert.equal(outcome, "repointed-replacement");
-                assert.equal(detectCurrentZcodeOrigin(dir, {}), DRIFT_REPLACEMENT);
+                assert.equal(detectCurrentZcodeOrigin(dir, {}), o.replacement);
             } else {
                 assert.equal(outcome, "reverted-direct");
                 assert.doesNotMatch(readFileSync(storeFile(dir), "utf8"), /\/bili\//);
@@ -728,16 +737,16 @@ for (const writePath of ["self", "replacement", "revert"] as const) {
         } finally {
             rmrf(dir);
         }
-    });
+    }));
 }
 
 for (const writePath of ["self", "replacement"] as const) {
-    test(`repairSharedStoreDrift leaves a store that went direct during its awaits (write path: ${writePath}) (#63)`, async () => {
+    test(`repairSharedStoreDrift leaves a store that went direct during its awaits (write path: ${writePath}) (#63)`, () => withDriftOrigins(async (o) => {
         const dir = dataDir();
         try {
             await routeZcodeConfig({ origin: DRIFT_DEAD, dataDir: dir, env: {}, log: NO_LOG });
             let direct = "";
-            const outcome = await repairDownPath(dir, writePath, () => {
+            const outcome = await repairDownPath(o, dir, writePath, () => {
                 unrouteZcode({ dataDir: dir, env: {}, log: NO_LOG });
                 direct = readFileSync(storeFile(dir), "utf8");
             });
@@ -747,19 +756,19 @@ for (const writePath of ["self", "replacement"] as const) {
         } finally {
             rmrf(dir);
         }
-    });
+    }));
 
     // The check has to sit inside the locked write: here the store still
     // points at the dead origin when the route call starts, and changes owner
     // only while that call is waiting for the config lock.
-    test(`repairSharedStoreDrift leaves a route taken while it waited for the config lock (write path: ${writePath}) (#63)`, async () => {
+    test(`repairSharedStoreDrift leaves a route taken while it waited for the config lock (write path: ${writePath}) (#63)`, () => withDriftOrigins(async (o) => {
         const dir = dataDir();
         const lockDir = path.join(dir, "v2", ".bili-config.lock");
         try {
             await routeZcodeConfig({ origin: DRIFT_DEAD, dataDir: dir, env: {}, log: NO_LOG });
             let taken = "";
             let heldWhenTaken = false;
-            const outcome = await repairDownPath(dir, writePath, () => {
+            const outcome = await repairDownPath(o, dir, writePath, () => {
                 // Another live process holds the lock, writes its route, releases.
                 mkdirSync(lockDir);
                 writeFileSync(path.join(lockDir, "pid"), String(process.pid));
@@ -778,7 +787,7 @@ for (const writePath of ["self", "replacement"] as const) {
         } finally {
             rmrf(dir);
         }
-    });
+    }));
 }
 
 test("handoffZcodeRoutingOnExit leaves a foreign pointer untouched (#1623)", async () => {
