@@ -25,6 +25,22 @@
 
 2026-11-08 验证的运行版本是 `51a1cdbf-live`，对应已评审源码 `51a1cdbf4e732bfe9cedae73aec8aee53ec20599`。其 Git tree 与已合并的 PR [#1](https://github.com/anuzzolilli-oss/billion-context/pull/1) 相同，合并提交为 `d6573a0881feb6102a3353e50060d07bf26099d9`。这是带日期的部署快照；后续操作前重新检查运行 manifest 与部署回执。
 
+### 运行中的 OmniRoute 路由——2026-11-15 已验证
+
+受监督的运行版本为 `0.1.213` / `d4aad618-live`。其上游在 `C:\Users\anuzz\AppData\Roaming\CindyGlobal\billion-context-proxy\config\billion-context\billion-context.json` 中设置为：
+
+```json
+"upstream": "https://castalia.taildf51a3.ts.net"
+```
+
+先前配置备份位于 `C:\Users\anuzz\AppData\Roaming\CindyGlobal\billion-context-proxy\backups\before-omniroute-upstream-20261115-012339`。
+
+在不修改源码或 OmniRoute 路由的前提下，已通过 Anthropic Messages wire 验证现有状态：
+
+- **端点链路与响应：**客户端 → bili（`http://127.0.0.1:8787/v1/messages`）→ OmniRoute（`https://castalia.taildf51a3.ts.net/v1/messages`）→ 提供商。`kmc/k3.1-pro-highspeed` 请求返回 HTTP 200、文本 `OK` 和 `stop_reason: end_turn`；OmniRoute 将其路由至 `kimi-coding/k3.1-pro-highspeed`。
+- **凭据透传：**客户端的 `x-api-key` 未经修改通过 bili，并被 OmniRoute 接受。bili 配置中未添加任何凭据，临时加密验证副本已删除。
+- **无路由环路：**最终检查在 OmniRoute 的提供商、combo 和代理配置中均未发现指向 bili、TheGame、端口 8787 或 OmniRoute 自身的目标。无需修改 OmniRoute 路由。
+
 部署配置使用 `promptPack: lean` 和 `nudgeGrowthTokens: 25000`。本地运行入口调用 `startServer` 时显式传入 `boundedMaintenance: { timeoutMs: 15000, maxTokens: 1024 }`。准备替换版本时保留该运行策略；仅构建标准 CLI 不会记录这一部署选择。
 
 ## Cindy 工作指令

@@ -25,6 +25,22 @@ The live proxy runs from a separate release directory under `%APPDATA%\CindyGlob
 
 As verified on 2026-11-08, live build `51a1cdbf-live` uses reviewed source `51a1cdbf4e732bfe9cedae73aec8aee53ec20599`. Its Git tree matches merged PR [#1](https://github.com/anuzzolilli-oss/billion-context/pull/1), merge commit `d6573a0881feb6102a3353e50060d07bf26099d9`. Treat these as a dated deployment snapshot; check the live manifest and deployment receipt before future operations.
 
+### Live OmniRoute routing — verified 2026-11-15
+
+The supervised live release is `0.1.213` / `d4aad618-live`. Its upstream is set in `C:\Users\anuzz\AppData\Roaming\CindyGlobal\billion-context-proxy\config\billion-context\billion-context.json`:
+
+```json
+"upstream": "https://castalia.taildf51a3.ts.net"
+```
+
+The previous configuration is backed up under `C:\Users\anuzz\AppData\Roaming\CindyGlobal\billion-context-proxy\backups\before-omniroute-upstream-20261115-012339`.
+
+The already-applied state was verified over the Anthropic Messages wire without changing source or OmniRoute routing:
+
+- **Endpoint chain and response:** client → bili at `http://127.0.0.1:8787/v1/messages` → OmniRoute at `https://castalia.taildf51a3.ts.net/v1/messages` → provider. The `kmc/k3.1-pro-highspeed` request returned HTTP 200 with text `OK` and `stop_reason: end_turn`; OmniRoute routed it to `kimi-coding/k3.1-pro-highspeed`.
+- **Credential passthrough:** the client's `x-api-key` passed through bili untouched and was accepted by OmniRoute. No credentials were added to bili's configuration, and the temporary encrypted verification copy was deleted.
+- **No routing loop:** the final inspection found no bili, TheGame, port-8787, or OmniRoute self-targets in OmniRoute's provider, combo, or proxy configuration. No OmniRoute routing change was needed.
+
 The deployed configuration uses `promptPack: lean` and `nudgeGrowthTokens: 25000`. Its local runtime entry calls `startServer` with `boundedMaintenance: { timeoutMs: 15000, maxTokens: 1024 }`. Preserve that explicit runtime policy when preparing a replacement; building the standard CLI alone does not capture this deployment choice.
 
 ## Instructions for work in Cindy
