@@ -528,6 +528,7 @@ type StoreDriftOutcome =
     | "unmanaged"
     | "self"
     | "foreign-live"
+    | "owner-changed"
     | "repointed-self"
     | "repointed-replacement"
     | "reverted-direct";
@@ -565,8 +566,14 @@ export async function repairSharedStoreDrift(opts: StoreDriftOptions): Promise<S
     if (await probe(current)) return "foreign-live";
     log(`shared store points at dead instance ${current} — repairing`);
     const policy = zcodePolicyFromEnv(env);
+    // #63: the probes and replacement discovery await, and another process may
+    // re-route the store meanwhile. Every write below is allowed only while the
+    // store still points at the dead origin this repair set out to replace; a
+    // store that now points anywhere else (or went direct) is someone else's
+    // decision and stays untouched. The route writes ask under the config lock.
+    const stillDead = () => detectCurrentZcodeOrigin(dataDir, env) === current;
     if (await probe(opts.selfOrigin)) {
-        const routed = await routeZcodeConfig({ origin: opts.selfOrigin, env, dataDir: opts.dataDir, log, policy });
+        const routed = await routeZcodeConfig({ origin: opts.selfOrigin, env, dataDir: opts.dataDir, log, policy, shouldWrite: stillDead });
         if (routed) {
             await activateZcodePluginMode(routed, { env, dataDir: opts.dataDir, log });
             log(`store repaired → ${opts.selfOrigin}`);
@@ -575,13 +582,19 @@ export async function repairSharedStoreDrift(opts: StoreDriftOptions): Promise<S
     } else {
         const replacement = await (opts.findReplacement ?? defaultFindReplacement)();
         if (replacement) {
-            const routed = await routeZcodeConfig({ origin: replacement.origin, env, dataDir: opts.dataDir, log, policy });
+            const routed = await routeZcodeConfig({ origin: replacement.origin, env, dataDir: opts.dataDir, log, policy, shouldWrite: stillDead });
             if (routed) {
                 await activateZcodePluginMode(routed, { env, dataDir: opts.dataDir, log });
                 log(`store repaired → ${replacement.origin}`);
                 return "repointed-replacement";
             }
         }
+    }
+    // Also reached when a route write above was declined: without this check a
+    // declined overwrite would become a revert of the new owner's route.
+    if (!stillDead()) {
+        log(`store drift repair: the store no longer points at ${current} — leaving it untouched`);
+        return "owner-changed";
     }
     unrouteZcode({ env, dataDir: opts.dataDir, log });
     log(`store reverted to direct upstream (${current} is dead)`);
