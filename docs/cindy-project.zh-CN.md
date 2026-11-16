@@ -23,7 +23,9 @@
 
 运行中的代理使用 `%APPDATA%\CindyGlobal\billion-context-proxy` 下独立的 release 目录，由现有计划任务 **Cindy - billion-context proxy** 管理，监听 `127.0.0.1:8787`。在开发目录构建或测试不会部署版本。
 
-2026-11-08 验证的运行版本是 `51a1cdbf-live`，对应已评审源码 `51a1cdbf4e732bfe9cedae73aec8aee53ec20599`。其 Git tree 与已合并的 PR [#1](https://github.com/anuzzolilli-oss/billion-context/pull/1) 相同，合并提交为 `d6573a0881feb6102a3353e50060d07bf26099d9`。这是带日期的部署快照；后续操作前重新检查运行 manifest 与部署回执。
+2026-11-16 依据部署回执 `%APPDATA%\CindyGlobal\billion-context-proxy\tuned-deployment.json` 验证：运行版本为 `d4aad618-live`，版本号 `0.1.213`，构建自源码 SHA `d4aad6189a7456059b12c7333662f499c633ca0c`——即 `master` 上 PR [#73](https://github.com/anuzzolilli-oss/billion-context/pull/73) 的合并提交。部署时间为 2026-11-14，该次切换的回滚备份位于 `%APPDATA%\CindyGlobal\billion-context-proxy\backups\before-master-20261114-214204`。这仍是带日期的部署快照：后续任何操作前须重新核对运行 manifest 与该回执。
+
+仅作证据保留的已被取代的历史：2026-11-08 快照记录的运行版本为 `51a1cdbf-live`，对应已评审源码 `51a1cdbf4e732bfe9cedae73aec8aee53ec20599`，其 Git tree 与已合并的 PR [#1](https://github.com/anuzzolilli-oss/billion-context/pull/1) 相同，合并提交为 `d6573a0881feb6102a3353e50060d07bf26099d9`。该状态已不再描述运行中的服务。
 
 ### 运行中的 OmniRoute 路由——2026-11-15 已验证
 
