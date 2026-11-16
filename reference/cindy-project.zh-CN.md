@@ -84,10 +84,13 @@ Get-Content (Join-Path $proxyRoot 'tuned-deployment.json')
 
 ## 仅在明确请求时部署
 
-1. 固定已评审源码 SHA，并检查该 SHA 的 CI 与评审。构建独立候选产物，记录哈希及本地运行 wrapper；使用生成数据和回环模拟上游，在隔离进程中测试同一产物。
+1. 固定人工合并后已评审的源码 SHA，并检查该准确 SHA 的 CI 与评审结果。构建独立候选产物，记录其哈希及任何本地运行 wrapper；使用生成数据和回环模拟上游，在隔离进程中测试该同一产物。
 2. 验证现有 supervisor、配置哈希、监听 PID/进程身份及空闲状态。准备新的 release 目录，备份 supervisor 和部署回执；保留认证、设置、原文及计划任务的登录启动/恢复职责。
-3. 仅更改现有代理的 release 路径。等待活跃请求结束后只重启该代理。启动失败时恢复保存的 launcher/回执，并重启旧版本。
-4. 检查 manifest 源码身份、唯一监听者及配置哈希不变。验证转发、实际折叠、原文/图片精确检索及该测试 session 的检查日志。获授权后可发送一个小型认证提供商请求。
-5. 完成部署回执，报告源码 SHA、结果及回滚位置。Canary 失败则恢复旧版本并报告。本地代理部署不包含 npm 发包或更新承载任务的 Cindy 应用。
+3. 运行版本的 bundle 由小型本地启动 wrapper `src/live-entry.ts` 配合保留的 esbuild 脚本 `build.mjs` 构建，而非标准 CLI 入口；只构建标准 CLI 无法体现该部署的运行时策略。该 wrapper 要求显式 `--port`（拒绝非整数以及小于 1024 或大于 65535 的端口），随后调用 `startServer({ ...loadOptions(), host: "127.0.0.1", port, passthrough: false, autoUpdate: false, autoRestartOnUpdate: false }, { boundedMaintenance: { timeoutMs: 15000, maxTokens: 1024 } })`，并记录已启用的 bounded maintenance。`build.mjs` 打包 `src/live-entry.ts` → `out/dist/index.mjs`（bundle/esm/node20，别名 `@earendil-works/pi-coding-agent` → `src/agent/pi-host-stub.ts`，external 为 `jimp, mysql2, mysql2/promise, bufferutil, utf-8-validate`，带 createRequire banner），并写出 `out/dist/build-info.json`，内含 `sourceCommit`、`bundleSha256`、`commit`（前 8 位加 `-live`）与 `localPatchSha256`；把这些哈希记入回执。
+4. 编辑 launcher 前必须先停止 supervisor，并在运行根目录创建 `maintenance.inhibit`；该文件会抑制 supervisor 的接管、启动与重启，被抑制期间已监控的子进程继续运行。在 supervisor 存活时修改 launcher 默认值不安全：接管按 PID 加进程创建时间进行，并在持有句柄后复核；每个安装只允许一个 supervisor，由 `supervisor.lock` 上的操作系统排他锁保持，因此第二次启动会立即以 0 退出。
+5. 仅更改现有代理的 release 路径。launcher 的 `ProxyPath`、`ExpectedVersion` 和 `ExpectedCommit` 默认值必须改为与新 release 一致，否则 supervisor 会失败关闭（fail closed）。当前 release 的已验证默认值为 `ProxyPath` = `...\releases\master-d4aad618\dist\index.mjs`、`ExpectedVersion` = `0.1.213`、`ExpectedCommit` = `d4aad618-live`，另有 `Port` = `8787`、`NodePath` = `C:\Program Files\nodejs\node.exe`、`RestartDelaySeconds` 5、`PollSeconds` 5、`HeartbeatSeconds` 15 及 `-ReportOnly` 开关。
+6. 遇到外来或未经验证的监听者、不可读/正在启动/不匹配的健康结果、匹配但未监听的进程、缺失的可执行文件，以及检查错误或超时，supervisor 会失败关闭：既不终止也不启动任何进程，状态每 `PollSeconds` 复核一次，且仅在变化时记录日志。等待活跃请求结束后只重启该代理。启动失败时恢复保存的 launcher/回执，并重启旧版本。
+7. 检查 manifest 源码身份、唯一监听者及配置哈希不变。验证转发、实际折叠、原文/图片精确检索及该测试 session 的检查日志。获授权后可发送一个小型认证提供商请求。
+8. 完成部署回执，报告源码 SHA、结果及回滚位置。Canary 失败则恢复旧版本并报告。本地代理部署不包含 npm 发包或更新承载任务的 Cindy 应用。
 
-初次修复的部署工具和详细历史日志保留在原任务的 `inspection-evidence` 目录。复用前检查其固定哈希和旧版本假设；不得在当前版本已变化时直接执行旧安装脚本，应重新建立身份及回滚检查。
+初次修复的部署工具保留在 `%APPDATA%\CindyGlobal\billion-context-proxy\backups\before-master-20261114-191918\tooling\`，其中恰好包含 `Deploy-Master.ps1`、`build.mjs`、`fold-test.mjs`、`iso-test.mjs` 和 `live-entry.ts`，回滚脚本 `Rollback-MasterDeploy.ps1` 就在同一位置旁边；该备份根目录同时保存 `Start-BillionContextProxy.ps1`、`proxy.identity.json`、`supervision-receipt.json`、`supervisor-status.json` 和 `tuned-deployment.json`。运行中的 launcher 是运行根目录中的 `Start-BillionContextProxy.ps1`，同一根目录下的 `Rollback-TunedLiveProxy.ps1` 用于回滚该 launcher。复用前检查这些保留的工具：它们含固定的构建哈希与旧版本假设。不得在当前版本已变化时直接执行旧安装脚本，应重新建立身份及回滚检查。

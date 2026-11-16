@@ -23,7 +23,9 @@ The development checkout holds source, local dependencies and test/build outputs
 
 The live proxy runs from a separate release directory under `%APPDATA%\CindyGlobal\billion-context-proxy`, managed by the existing scheduled task **Cindy - billion-context proxy**. It listens on `127.0.0.1:8787`. Building or testing the checkout does not deploy a release.
 
-As verified on 2026-11-08, live build `51a1cdbf-live` uses reviewed source `51a1cdbf4e732bfe9cedae73aec8aee53ec20599`. Its Git tree matches merged PR [#1](https://github.com/anuzzolilli-oss/billion-context/pull/1), merge commit `d6573a0881feb6102a3353e50060d07bf26099d9`. Treat these as a dated deployment snapshot; check the live manifest and deployment receipt before future operations.
+As verified on 2026-11-16 from the deployment receipt `%APPDATA%\CindyGlobal\billion-context-proxy\tuned-deployment.json`, the live build is `d4aad618-live`, version `0.1.213`, built from source SHA `d4aad6189a7456059b12c7333662f499c633ca0c` — the merge commit of PR [#73](https://github.com/anuzzolilli-oss/billion-context/pull/73) on `master`. It was deployed on 2026-11-14, and the rollback backup for that cutover is `%APPDATA%\CindyGlobal\billion-context-proxy\backups\before-master-20261114-214204`. Treat these as a dated deployment snapshot: re-check the live manifest and this receipt before any future operation.
+
+Superseded history, kept only as evidence: the 2026-11-08 snapshot recorded live build `51a1cdbf-live` from reviewed source `51a1cdbf4e732bfe9cedae73aec8aee53ec20599`, whose Git tree matched merged PR [#1](https://github.com/anuzzolilli-oss/billion-context/pull/1), merge commit `d6573a0881feb6102a3353e50060d07bf26099d9`. That state no longer describes the live service.
 
 ### Live OmniRoute routing — verified 2026-11-15
 
