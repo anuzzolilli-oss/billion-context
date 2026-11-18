@@ -5,7 +5,8 @@
 #     execute, launcherSuffix,                  optional: what the task action claims to run
 #     failOn: [ { op, call } ],                 the n-th call of that operation throws
 #     onCall: [ { op, call, action } ] }        the n-th call first performs a fault action
-# Actions: openClient, makeLauncherReadOnly, writeForeignInhibit, editLauncher, killSelf.
+# Actions: openClient, makeLauncherReadOnly, writeForeignInhibit, editLauncher, killSelf, changeTaskAction,
+# pause (writes sandbox-paused, then waits for sandbox-release so a test can act while this run is in progress).
 
 function Get-LpTestTaskStatePath { return (Join-Path $script:LpRoot 'sandbox-task.json') }
 function Get-LpTestTaskState { return ([System.IO.File]::ReadAllText((Get-LpTestTaskStatePath)) | ConvertFrom-Json -AsHashtable) }
@@ -33,6 +34,11 @@ function Invoke-LpTestFault([string]$Op) {
             'writeForeignInhibit' { [System.IO.File]::WriteAllText((Join-Path $script:LpRoot 'maintenance.inhibit'), 'someone else') }
             'editLauncher' { Add-Content -LiteralPath (Get-LpTestLauncher) -Value '# foreign edit' }
             'killSelf' { Stop-Process -Id $PID -Force }
+            'changeTaskAction' { $s['launcherSuffix'] = '.moved'; Save-LpTestTaskState $s }
+            'pause' {
+                [System.IO.File]::WriteAllText((Join-Path $script:LpRoot 'sandbox-paused'), 'paused')
+                $null = Wait-LpUntil { Test-Path -LiteralPath (Join-Path $script:LpRoot 'sandbox-release') } 120 'paused by the test'
+            }
         }
     }
     foreach ($f in @($s.failOn)) {

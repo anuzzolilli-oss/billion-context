@@ -304,6 +304,8 @@ try {
     if (-not (Test-LpSameHash (Get-LpSha256 $ctx.LauncherPath) $ctx.Record.launcherSha256Before)) {
         Stop-LpRollbackFailed $ctx 'launcher edit: the launcher was changed by someone else after preflight; it was left as found' 'foreign-launcher-edit'
     }
+    # Nothing has been changed yet: if the inhibit is no longer this run's, someone else's maintenance has begun.
+    if (-not (Test-LpOwnInhibit $ctx)) { throw 'maintenance.inhibit is no longer the one this run created' }
     Set-LpStage $ctx 'held'
     Write-LpBytesAtomic $ctx.LauncherPath $editedBytes
     Write-LpEvent 'STEP' "launcher updated: $($edit.Changed -join ', ')"

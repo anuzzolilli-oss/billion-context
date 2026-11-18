@@ -527,6 +527,8 @@ describe("live-deploy scripts: refusals leave everything untouched", { skip: SKI
             // A task whose action only resembles this launcher, or is not run by Windows PowerShell.
             patchTask(sb, { launcherSuffix: ".disabled" });
             await refuse("task runs another file", {}, [/FAIL scheduled task runs this launcher: the task action does not run the launcher/]);
+            patchTask(sb, { launcherSuffix: `.other.ps1" -File "${path.join(sb.root, LAUNCHER)}` });
+            await refuse("task passes the launcher as data to another script", {}, [/FAIL scheduled task runs this launcher: the task action does not run the launcher/]);
             patchTask(sb, { launcherSuffix: "", execute: "pwsh.exe" });
             await refuse("task runs another program", {}, [/FAIL scheduled task runs this launcher: the task action is not Windows PowerShell/]);
             patchTask(sb, { execute: "" });
@@ -918,14 +920,66 @@ describe("live-deploy scripts: deployment and rollback", { skip: SKIP, concurren
         });
     });
 
+    test("a task changed after preflight stops the run before anything is touched", async () => {
+        await withSandbox(async (sb) => {
+            const before = launcher(sb);
+            const ids = { sup: supervisorPid(sb), proxy: (await health(sb.port))!.pid };
+            // The second task read is the comparison with the task that preflight validated.
+            patchTask(sb, { onCall: [{ op: "info", call: 2, action: "changeTaskAction" }] });
+            const r = await deploy(sb);
+            expectResult(r, 6, "error-before-hold");
+            assert.match(r.out, /the scheduled task was changed after preflight/);
+            assert.equal(record(onlyBackup(sb)).stage, "aborted");
+            const calls = getTask(sb).calls;
+            assert.deepEqual([calls.disable, calls.enable, calls.start], [0, 0, 0]);
+            assert.equal(inhibit(sb), null);
+            assert.equal(launcher(sb), before);
+            assert.equal(fs.existsSync(releaseDir(sb)), false);
+            assert.equal(alive(ids.sup) && supervisorPid(sb) === ids.sup, true);
+            assert.equal((await health(sb.port))!.pid, ids.proxy);
+        });
+    });
+
+    test("an inhibit replaced by someone else during the hold is kept and nothing is restarted", async () => {
+        await withSandbox(async (sb) => {
+            const before = launcher(sb);
+            const proxy = (await health(sb.port))!.pid;
+            const sup = supervisorPid(sb);
+            // This run's own inhibit exists by the first "disable"; the fault overwrites it with a foreign one.
+            patchTask(sb, { onCall: [{ op: "disable", call: 1, action: "writeForeignInhibit" }] });
+            const r = await deploy(sb);
+            expectResult(r, 4, "rollback-failed", "rollback-error");
+            assert.match(r.out, /maintenance\.inhibit is no longer the one this run created/);
+            assert.match(r.out, /hold NOT fully in place: inhibit present but owned by other maintenance/);
+            assert.equal(inhibit(sb), "someone else", "the foreign inhibit must be kept exactly");
+            const task = getTask(sb);
+            assert.equal(task.enabled, false);
+            assert.deepEqual([task.calls.enable, task.calls.start], [0, 0], "supervision must not be restarted under someone else's maintenance");
+            assert.equal(alive(sup), false);
+            assert.equal(launcher(sb), before, "the launcher must not have been edited");
+            const h = await health(sb.port);
+            assert.equal(h!.pid, proxy, "the running proxy must not have been stopped");
+            assert.equal(h!.commit, PREV.commit);
+        });
+    });
+
     test("a second deploy is refused while one is running", async () => {
         await withSandbox(async (sb) => {
+            // The first run is paused inside its hold, so it provably still owns the lock when the second starts.
+            patchTask(sb, { onCall: [{ op: "disable", call: 1, action: "pause" }] });
             const first = deploy(sb);
-            await waitFor("the first run to write its backup", () => backups(sb).length === 1);
-            const second = await deploy(sb, { ReleaseName: "cand-2" });
-            assert.equal(second.code, 2, second.out);
-            assert.match(second.out, /another deploy or rollback is running for this runtime root/);
-            assert.equal(fs.existsSync(releaseDir(sb, "cand-2")), false);
+            try {
+                await waitFor("the first run to pause", () => fs.existsSync(path.join(sb.root, "sandbox-paused")));
+                const second = await deploy(sb, { ReleaseName: "cand-2" });
+                assert.equal(second.code, 2, second.out);
+                assert.match(second.out, /another deploy or rollback is running for this runtime root/);
+                assert.equal(fs.existsSync(releaseDir(sb, "cand-2")), false);
+                const back = await rollback(sb, onlyBackup(sb));
+                assert.equal(back.code, 2, back.out);
+                assert.match(back.out, /another deploy or rollback is running for this runtime root/);
+            } finally {
+                fs.writeFileSync(path.join(sb.root, "sandbox-release"), "go");
+            }
             expectResult(await first, 0, "deployed");
             assert.equal(backups(sb).length, 1);
             assert.equal(fs.existsSync(path.join(sb.root, "live-deploy.lock")), false, "the operation lock goes away with the process");

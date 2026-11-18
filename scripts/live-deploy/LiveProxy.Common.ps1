@@ -225,18 +225,40 @@ function Get-LpClientCount($Ctx) {
     return @($rows | Where-Object { @('127.0.0.1', '::1') -contains [string]$_.RemoteAddress -and $own -notcontains [int]$_.OwningProcess }).Count
 }
 
-# Processes of one image whose command line contains the given text. The text names how the process was
-# started, not just a path: a process that merely receives the path as an argument does not match.
-function Get-LpProcesses([string]$ImageName, [string]$Needle) {
-    return @(Get-CimInstance Win32_Process -Filter "Name='$ImageName'" -OperationTimeoutSec 15 -ErrorAction Stop |
-        Where-Object { $null -ne $_.CommandLine -and $_.CommandLine.IndexOf($Needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 })
+# Splits a command line into its arguments: blanks separate, double quotes group. Enough for the two
+# command lines this installation produces; anything more exotic simply does not match below.
+function Split-LpCommandLine([string]$Line) {
+    $out = [System.Collections.Generic.List[string]]::new()
+    $cur = [System.Text.StringBuilder]::new(); $inQuote = $false; $has = $false
+    foreach ($ch in $Line.ToCharArray()) {
+        if ($ch -eq '"') { $inQuote = -not $inQuote; $has = $true; continue }
+        if (-not $inQuote -and [char]::IsWhiteSpace($ch)) { if ($has) { $out.Add($cur.ToString()); $null = $cur.Clear(); $has = $false }; continue }
+        $null = $cur.Append($ch); $has = $true
+    }
+    if ($has) { $out.Add($cur.ToString()) }
+    return , $out.ToArray()
+}
+# True when these PowerShell host arguments run the launcher itself: the first -File is the host's own
+# (nothing before it hands control to a command), and its operand is the launcher. A launcher path that
+# only appears later, as data for another script, does not count.
+function Test-LpRunsLauncher([string[]]$HostArgs, [string]$LauncherPath) {
+    for ($i = 0; $i -lt $HostArgs.Count; $i++) {
+        $a = $HostArgs[$i]
+        if ($a -match '^-(c|command|e|ec|encodedcommand)$') { return $false }
+        if ($a -ieq '-File') { return ($i + 1 -lt $HostArgs.Count -and $HostArgs[$i + 1] -ieq $LauncherPath) }
+    }
+    return $false
+}
+function Get-LpProcessesOf([string]$ImageName) {
+    return @(Get-CimInstance Win32_Process -Filter "Name='$ImageName'" -OperationTimeoutSec 15 -ErrorAction Stop | Where-Object { $null -ne $_.CommandLine })
 }
 # The supervisor is Windows PowerShell running the launcher as its -File script.
-function Get-LpSupervisors($Ctx) { return @(Get-LpProcesses 'powershell.exe' ('-File "' + $Ctx.LauncherPath + '"')) }
-# A proxy is node running the bundle as its entry point: "<node>" "<bundle>" start ...
+function Get-LpSupervisors($Ctx) {
+    return @(Get-LpProcessesOf 'powershell.exe' | Where-Object { $t = Split-LpCommandLine $_.CommandLine; $t.Count -gt 1 -and (Test-LpRunsLauncher @($t | Select-Object -Skip 1) $Ctx.LauncherPath) })
+}
+# A proxy is node running the bundle as its entry point: <node> <bundle> start ...
 function Get-LpProxies([string]$ProxyPath) {
-    $needle = '" "' + $ProxyPath + '" start '
-    return @(Get-LpProcesses 'node.exe' $needle | Where-Object { $_.CommandLine.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -eq $_.CommandLine.IndexOf('" "', [System.StringComparison]::Ordinal) })
+    return @(Get-LpProcessesOf 'node.exe' | Where-Object { $t = Split-LpCommandLine $_.CommandLine; $t.Count -ge 3 -and $t[1] -ieq $ProxyPath -and $t[2] -ceq 'start' })
 }
 
 # Stops the process that was matched. One handle is opened, its start time is compared with the matched
@@ -252,7 +274,8 @@ function Stop-LpProcessVerified($Process) {
             if ($p.HasExited) { return }
             throw
         }
-        if ([Math]::Abs(($started - $Process.CreationDate.ToUniversalTime()).TotalSeconds) -ge 1) { throw "pid $($Process.ProcessId) now belongs to a different process; not stopping it" }
+        # Both values come from the same kernel timestamp; they differ only by rounding below a millisecond.
+        if ([Math]::Abs(($started - $Process.CreationDate.ToUniversalTime()).TotalMilliseconds) -ge 1) { throw "pid $($Process.ProcessId) now belongs to a different process; not stopping it" }
         try { $p.Kill() } catch { if (-not $p.HasExited) { throw } }
     } finally {
         $p.Dispose()
@@ -312,7 +335,7 @@ function Get-LiveProxyTaskInfo([string]$TaskName) {
 # with the launcher as its -File script; a path that merely starts with the launcher path does not count.
 function Get-LpTaskActionGap($Task, [string]$LauncherPath) {
     if ([System.IO.Path]::GetFileName([string]$Task.Execute) -ine 'powershell.exe') { return 'the task action is not Windows PowerShell (powershell.exe)' }
-    if (([string]$Task.ActionArguments).IndexOf('-File "' + $LauncherPath + '"', [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return 'the task action does not run the launcher in this runtime root' }
+    if (-not (Test-LpRunsLauncher (Split-LpCommandLine ([string]$Task.ActionArguments)) $LauncherPath)) { return 'the task action does not run the launcher in this runtime root' }
     return $null
 }
 function Test-LpSameTask($A, $B) {
@@ -368,12 +391,16 @@ function New-LpInhibit($Ctx, [string]$Verb) {
     $s = [System.IO.File]::Open($Ctx.InhibitPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
     $written = $false
     try {
-        $s.Write($bytes, 0, $bytes.Length)
-        $s.Flush($true)
-        $written = $true
+        try {
+            $s.Write($bytes, 0, $bytes.Length)
+            $s.Flush($true)
+            $written = $true
+        } finally {
+            $s.Dispose()
+        }
     } finally {
-        $s.Dispose()
-        # The file exists only because this call created it: a marker without its owner text must not stay.
+        # The file exists only because this call created it: a marker without its owner text must not stay,
+        # also when closing the file is what failed.
         if (-not $written) { Remove-Item -LiteralPath $Ctx.InhibitPath -Force -ErrorAction SilentlyContinue }
     }
 }
@@ -568,6 +595,8 @@ function Invoke-LpRollback($Ctx, [byte[]]$RestoreLauncherBytes, [hashtable]$Rece
         $step = 'lift after rollback'
         if ($SkipHoldAndRestore) {
             # The hold was never completed: remove this deployment's inhibit and re-enable supervision as it was.
+            # An inhibit that is no longer this deployment's belongs to someone else's maintenance: nothing is started.
+            if ((Test-Path -LiteralPath $Ctx.InhibitPath) -and -not (Test-LpOwnInhibit $Ctx)) { throw 'maintenance.inhibit now belongs to other maintenance; it was left as found and supervision was not restarted' }
             if (Test-LpOwnInhibit $Ctx) { Remove-Item -LiteralPath $Ctx.InhibitPath -Force }
             $Ctx.LiftAt = (Get-Date).ToUniversalTime()
             Enable-LiveProxyTask $Ctx.TaskName
