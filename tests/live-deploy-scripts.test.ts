@@ -442,6 +442,50 @@ describe("live-deploy scripts: static rules", () => {
     });
 });
 
+// Pure functions and one disposable process: no sandbox, nothing near a real installation.
+describe("live-deploy scripts: process identity", { skip: SKIP }, () => {
+    const runCommon = (body: string) => {
+        const r = spawnSync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", `. '${COMMON}'; ${body}`], { encoding: "utf8", timeout: 120000 });
+        assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+        return r.stdout.trim().split(/\r?\n/);
+    };
+
+    test("only the host's own -File operand makes a process the supervisor", () => {
+        const L = "X:\\rt\\Start-BillionContextProxy.ps1";
+        const cases: [string, boolean][] = [
+            [`-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "${L}"`, true],
+            [`-noprofile -FILE "${L.toUpperCase()}"`, true],
+            [`-File "${L}" -Port 1`, true],
+            [`-NoProfile -File "X:\\tools\\Watch.ps1" -File "${L}"`, false],
+            [`-NoProfile -f "X:\\tools\\Watch.ps1" -File "${L}"`, false],
+            [`-NoProfile -Command "x" -File "${L}"`, false],
+            [`-NoProfile -File "${L}.disabled"`, false],
+            [`-NoProfile -ExecutionPolicy -File "${L}"`, false],
+            ["-NoProfile -File", false],
+        ];
+        const lines = cases.map(([args]) => `Test-LpRunsLauncher (Split-LpCommandLine '${args}') '${L}'`).join("; ");
+        assert.deepEqual(runCommon(lines), cases.map(([, want]) => (want ? "True" : "False")));
+    });
+
+    test("a process is stopped only when it is the one that was matched", () => {
+        const out = runCommon(
+            [
+                "$p = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\\WindowsPowerShell\\v1.0\\powershell.exe') -ArgumentList '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 120' -WindowStyle Hidden -PassThru",
+                "try {",
+                '  $snap = Get-CimInstance Win32_Process -Filter "ProcessId=$($p.Id)"',
+                // Same PID, creation time half a second earlier: what a reused PID would look like.
+                "  $stale = [pscustomobject]@{ ProcessId = $snap.ProcessId; CreationDate = $snap.CreationDate.AddMilliseconds(-500) }",
+                "  try { Stop-LpProcessVerified $stale; 'no error' } catch { $_.Exception.Message -replace '\\d+', 'N' }",
+                "  Start-Sleep -Milliseconds 300; \"alive=$(-not $p.HasExited)\"",
+                "  Stop-LpProcessVerified $snap",
+                "  \"stopped=$($p.WaitForExit(10000))\"",
+                "} finally { if (-not $p.HasExited) { $p.Kill() } }",
+            ].join("\n"),
+        );
+        assert.deepEqual(out, ["pid N now belongs to a different process; not stopping it", "alive=True", "stopped=True"]);
+    });
+});
+
 // ---- refusals: nothing may change ---------------------------------------------------------------------
 
 describe("live-deploy scripts: refusals leave everything untouched", { skip: SKIP }, () => {
@@ -960,6 +1004,26 @@ describe("live-deploy scripts: deployment and rollback", { skip: SKIP, concurren
             const h = await health(sb.port);
             assert.equal(h!.pid, proxy, "the running proxy must not have been stopped");
             assert.equal(h!.commit, PREV.commit);
+        });
+    });
+
+    test("an inhibit replaced by someone else during the rollback is kept and nothing is restarted", async () => {
+        await withSandbox(async (sb) => {
+            const before = launcher(sb);
+            const sup = supervisorPid(sb);
+            fs.writeFileSync(path.join(sb.root, "proxy-control.json"), JSON.stringify({ "cand-1": { unhealthy: true } }));
+            // The second "disable" is the rollback's hold, taken right after the rollback created its own inhibit.
+            patchTask(sb, { onCall: [{ op: "disable", call: 2, action: "writeForeignInhibit" }] });
+            const r = await deploy(sb, { HealthWaitSeconds: 6 });
+            expectResult(r, 4, "rollback-failed", "rollback-error");
+            assert.match(r.out, /lift after rollback \(maintenance\.inhibit is no longer the one this run created; it was left as found\)/);
+            assert.equal(inhibit(sb), "someone else", "the foreign inhibit must be kept exactly");
+            const task = getTask(sb);
+            assert.equal(task.enabled, false);
+            // One enable and one start: the deployment's own lift. The rollback must not have lifted anything.
+            assert.deepEqual([task.calls.enable, task.calls.start], [1, 1]);
+            assert.equal(alive(sup), false);
+            assert.equal(launcher(sb), before, "the launcher was restored before the lift was refused");
         });
     });
 

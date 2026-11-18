@@ -238,14 +238,19 @@ function Split-LpCommandLine([string]$Line) {
     if ($has) { $out.Add($cur.ToString()) }
     return , $out.ToArray()
 }
-# True when these PowerShell host arguments run the launcher itself: the first -File is the host's own
-# (nothing before it hands control to a command), and its operand is the launcher. A launcher path that
-# only appears later, as data for another script, does not count.
+# True when these PowerShell host arguments run the launcher itself: only the options this installation
+# uses may come before -File, spelled in full, and the operand of -File is the launcher. Anything else,
+# including abbreviated options, does not match: a launcher path that only appears later, as data for
+# another script, never counts.
 function Test-LpRunsLauncher([string[]]$HostArgs, [string]$LauncherPath) {
+    $switches = @('-NoProfile', '-NonInteractive', '-NoLogo')
+    $valued = @('-ExecutionPolicy', '-WindowStyle')
     for ($i = 0; $i -lt $HostArgs.Count; $i++) {
         $a = $HostArgs[$i]
-        if ($a -match '^-(c|command|e|ec|encodedcommand)$') { return $false }
         if ($a -ieq '-File') { return ($i + 1 -lt $HostArgs.Count -and $HostArgs[$i + 1] -ieq $LauncherPath) }
+        if ($switches -icontains $a) { continue }
+        if ($valued -icontains $a) { $i++; continue }
+        return $false
     }
     return $false
 }
