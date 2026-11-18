@@ -122,6 +122,11 @@ export const LIVE_FILES = [
     "tests/ci-stall-watch.test.ts",
     // #69: runs copies of run-ci-tests.mjs as subprocesses; no ports.
     "tests/ci-runner-stall-gate.test.ts",
+    // #80: runs the live-proxy deploy and rollback scripts against throw-away
+    // sandboxes (Windows only; skipped elsewhere). Every sandbox has its own
+    // temp folder, a listen(0)-probed port and a file-backed stand-in for the
+    // scheduled task, so no zone band and no machine-global state is used.
+    "tests/live-deploy-scripts.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
