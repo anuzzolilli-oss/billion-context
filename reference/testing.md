@@ -63,7 +63,7 @@ flakes were loaded local sandboxes — gated by `ACP_TEST_CLAUDE_NATIVE`, not CI
 The script self-checks on every run: a new top-level `tests/*.test.ts` that
 matches a process-spawn pattern but is NOT registered in its `LIVE_FILES` list
 fails the job. When you add a suite that spawns processes, register it in
-`scripts/run-ci-tests.mjs` and review its concurrency assumptions (#1248:
+`scripts/live-files.mjs` (append-only) and review its concurrency assumptions (#1248:
 per-file XDG homes, `listen(0)` ports, no machine-global state) before it
 rides c=4 unreviewed.
 

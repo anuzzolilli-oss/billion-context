@@ -847,6 +847,7 @@
     "tests/incremental-ack-pull.test.ts": 10547,
     "tests/issue4323-drift-escalation.test.ts": 2194,
     "tests/pi-host-stub.test.ts": 136,
-    "tests/server-close-all-connections.test.ts": 3212
+    "tests/server-close-all-connections.test.ts": 3212,
+    "tests/live-deploy-scripts.test.ts": 221000
   }
 }
