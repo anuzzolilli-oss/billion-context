@@ -1,4 +1,4 @@
-#requires -Version 7.0
+#requires -Version 7.2
 <#
 .SYNOPSIS
 Rolls one live proxy deployment back to the release it replaced, from that deployment's backup folder.
@@ -57,6 +57,9 @@ try {
     $root = Resolve-LpPath $RuntimeRoot
     if (Test-LpReparseInPath $root) { Stop-Refused 'a folder in the runtime root path is a link' }
     $script:LpRoot = $root
+    # A full run takes the operation lock before it looks at anything; -PreflightOnly creates no file at all.
+    if (-not $PreflightOnly) { try { Enter-LpOperation $root } catch { Stop-Refused $_.Exception.Message } }
+
     $driver = $null
     try { $driver = Resolve-LpTaskDriver $RuntimeRoot $root $TestTaskDriver } catch { Stop-Refused $_.Exception.Message }
     if ($driver) { . $driver; Write-LpEvent 'STEP' 'TEST SEAM ACTIVE: scheduled-task operations go to the test driver' }
@@ -102,7 +105,8 @@ try {
     if ((Test-Path -LiteralPath $ctx.InhibitPath) -and -not $ownHold) { Stop-Refused 'maintenance.inhibit is present and belongs to other maintenance' }
     $task = Get-LiveProxyTaskInfo $ctx.TaskName
     if ($task.Count -ne 1) { Stop-Refused "expected exactly one scheduled task named in the record, found $($task.Count)" }
-    if ($task.ActionArguments.IndexOf($ctx.LauncherPath, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { Stop-Refused 'the task action does not run the launcher in this runtime root' }
+    $actionGap = Get-LpTaskActionGap $task $ctx.LauncherPath
+    if ($actionGap) { Stop-Refused $actionGap }
     $ctx.TaskBaseline = $task
 
     $dp = Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$rec.deployProcess.pid)" -OperationTimeoutSec 15 -ErrorAction Stop
@@ -116,7 +120,7 @@ try {
     if ($stage -eq 'rolled-back') { Stop-Refused 'this deployment was already rolled back' }
     if (@('prepared', 'aborted') -contains $stage) { Stop-Refused "this deployment stopped at stage '$stage' and changed nothing" }
     # A disabled task is this deployment's doing only if its own hold is in place or it stopped inside the hold window.
-    if (-not $task.Enabled -and -not $ownHold -and @('holding', 'held', 'cut', 'rollback-failed') -notcontains $stage) { Stop-Refused "the scheduled task is disabled and neither this deployment's hold nor its stage '$stage' explains it; other maintenance may be in progress" }
+    if (-not $task.Enabled -and -not $ownHold -and @('holding', 'held', 'cut', 'rolling-back', 'rollback-failed') -notcontains $stage) { Stop-Refused "the scheduled task is disabled and neither this deployment's hold nor its stage '$stage' explains it; other maintenance may be in progress" }
 
     $ctx.ConfigSha = Get-LpSha256 $ctx.ConfigPath
     $receipts = @{}
@@ -128,6 +132,8 @@ try {
         Write-LpEvent 'STEP' "would do: $plan"
         throw [LpStop]::new(0, 'preflight-ok', 'rollback preflight passed; nothing was changed', '', 'run again without -PreflightOnly to roll back')
     }
+    # Journal the rollback before anything is changed, so that an interrupted run can be recognised and retried.
+    try { Set-LpStage $ctx 'rolling-back' } catch { Stop-Refused "the deployment record cannot be written ($($_.Exception.Message))" }
 } catch [LpStop] {
     Complete-Lp $null $_.Exception $null
 } catch {
@@ -136,10 +142,13 @@ try {
 
 try {
     Invoke-LpRollback $ctx $backupLauncher $receipts $false
-    Set-LpStage $ctx 'rolled-back'
-    Complete-Lp $ctx ([LpStop]::new(0, 'restored', "the previous release $($ctx.Previous.version), $($ctx.Previous.commit) is live under supervision; receipts describe it", '', 'report the failure, the release left live and the backup location (step 10). A later deployment needs a new -ReleaseName.')) 'rollback-result.json'
+    # The previous release is live and checked from here on: a bookkeeping error must not read as a failed rollback.
+    $note = ''
+    try { Set-LpStage $ctx 'rolled-back' } catch { $note = ' The deployment record could not be updated; running this rollback again is harmless.' }
+    Complete-Lp $ctx ([LpStop]::new(0, 'restored', "the previous release $($ctx.Previous.version), $($ctx.Previous.commit) is live under supervision; receipts describe it.$note", '', 'report the failure, the release left live and the backup location (step 10). A later deployment needs a new -ReleaseName.')) 'rollback-result.json'
 } catch [LpStop] {
     Complete-Lp $ctx $_.Exception 'rollback-result.json'
 } catch {
-    Complete-Lp $ctx ([LpStop]::new(4, 'rollback-failed', "rollback stopped unexpectedly: $($_.Exception.Message). Check by hand that maintenance.inhibit is present, the task is disabled and no supervisor runs.", 'rollback-error', 'report to the owner; no release is confirmed live')) 'rollback-result.json'
+    # Exit 4 always means the hold was re-applied and evidence was collected.
+    try { Stop-LpRollbackFailed $ctx "unexpected error ($($_.Exception.Message))" 'rollback-error' } catch [LpStop] { Complete-Lp $ctx $_.Exception 'rollback-result.json' }
 }

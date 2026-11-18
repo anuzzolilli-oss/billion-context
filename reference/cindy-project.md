@@ -101,7 +101,7 @@ Steps 4–9 follow the order the kept `Deploy-Master.ps1` implements: the superv
 
 ### Deploy and rollback scripts
 
-`scripts/live-deploy/Deploy-LiveProxy.ps1` and `scripts/live-deploy/Rollback-LiveProxy.ps1` need PowerShell 7 and take every installation-specific value as a parameter; nothing about a release, the port or the task is written into them. Run them non-interactively, and run the deploy script with `-PreflightOnly` first: it performs every check, prints the plan and changes nothing.
+`scripts/live-deploy/Deploy-LiveProxy.ps1` and `scripts/live-deploy/Rollback-LiveProxy.ps1` need PowerShell 7.2 or later and take every installation-specific value as a parameter; nothing about a release, the port or the task is written into them. Only one deploy or rollback can run for a runtime root at a time; a second one is refused. Run them non-interactively, and run the deploy script with `-PreflightOnly` first: it performs every check, prints the plan and changes nothing.
 
 ```powershell
 pwsh -NoProfile -NonInteractive -File scripts\live-deploy\Deploy-LiveProxy.ps1 `

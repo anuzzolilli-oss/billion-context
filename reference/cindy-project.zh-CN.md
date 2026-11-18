@@ -101,7 +101,7 @@ Get-Content (Join-Path $proxyRoot 'tuned-deployment.json')
 
 ### 部署与回滚脚本
 
-`scripts/live-deploy/Deploy-LiveProxy.ps1` 与 `scripts/live-deploy/Rollback-LiveProxy.ps1` 需要 PowerShell 7，所有与具体安装相关的值都以参数传入；脚本中不写入任何 release、端口或计划任务的信息。请以非交互方式运行，并先用 `-PreflightOnly` 运行部署脚本：它执行全部检查、打印计划，且不做任何更改。
+`scripts/live-deploy/Deploy-LiveProxy.ps1` 与 `scripts/live-deploy/Rollback-LiveProxy.ps1` 需要 PowerShell 7.2 或更高版本，所有与具体安装相关的值都以参数传入；脚本中不写入任何 release、端口或计划任务的信息。同一运行时根目录同一时间只能运行一个部署或回滚，第二个会被拒绝。请以非交互方式运行，并先用 `-PreflightOnly` 运行部署脚本：它执行全部检查、打印计划，且不做任何更改。
 
 ```powershell
 pwsh -NoProfile -NonInteractive -File scripts\live-deploy\Deploy-LiveProxy.ps1 `

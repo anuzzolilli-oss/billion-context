@@ -103,9 +103,9 @@ function candidateDir(root: string): string {
     return `${root}-cand`;
 }
 
-async function makeSandbox(suffix = "", cand = CAND): Promise<Sandbox> {
+async function makeSandbox(suffix = "", cand = CAND, stem = crypto.randomBytes(5).toString("hex")): Promise<Sandbox> {
     const port = await freePort();
-    const root = path.join(tempBase(), `bili-live-deploy-${crypto.randomBytes(5).toString("hex")}${suffix}`);
+    const root = path.join(tempBase(), `bili-live-deploy-${stem}${suffix}`);
     assertSandbox(root, port);
     const canary = `CANARY-${crypto.randomBytes(6).toString("hex")}`;
     fs.mkdirSync(path.join(root, "config", "billion-context"), { recursive: true });
@@ -262,8 +262,8 @@ async function teardown(sb: Sandbox): Promise<void> {
     }
 }
 
-async function withSandbox(fn: (sb: Sandbox) => Promise<void>, suffix = "", cand = CAND): Promise<void> {
-    const sb = await makeSandbox(suffix, cand);
+async function withSandbox(fn: (sb: Sandbox) => Promise<void>, suffix = "", cand = CAND, stem?: string): Promise<void> {
+    const sb = await makeSandbox(suffix, cand, stem);
     try {
         await fn(sb);
     } finally {
@@ -348,7 +348,12 @@ const launcher = (sb: Sandbox) => fs.readFileSync(path.join(sb.root, LAUNCHER), 
 const releaseDir = (sb: Sandbox, name = "cand-1") => path.join(sb.root, "releases", name);
 const supervisorPid = (sb: Sandbox) => Number(status(sb)?.supervisorPid ?? 0);
 
-function assertUntouched(sb: Sandbox, launcherBefore: string): void {
+function assertUntouched(sb: Sandbox, launcherBefore: string, ids: { sup?: number; proxy?: number } = {}): void {
+    const calls = getTask(sb).calls;
+    assert.deepEqual({ disable: calls.disable, enable: calls.enable, start: calls.start }, { disable: 0, enable: 0, start: 0 }, "the task must not be disabled, enabled or started");
+    if (ids.sup) assert.equal(alive(ids.sup) && supervisorPid(sb) === ids.sup, true, "the same supervisor must still be running");
+    if (ids.proxy) assert.equal(alive(ids.proxy), true, "the same proxy process must still be running");
+    assert.equal(fs.existsSync(path.join(sb.root, "live-deploy.lock")), false, "no operation lock may be left behind");
     assert.equal(inhibit(sb), null, "no inhibit may be left behind");
     assert.equal(fs.existsSync(releaseDir(sb)), false, "no release directory may be created");
     assert.equal(backups(sb).length, 0, "no backup folder may be created");
@@ -443,12 +448,14 @@ describe("live-deploy scripts: refusals leave everything untouched", { skip: SKI
     test("input validation and preflight refuse, each for its own reason", async () => {
         await withSandbox(async (sb) => {
             const before = launcher(sb);
+            // Identities of the running supervisor and proxy: no refusal may replace either.
+            let ids: { sup?: number; proxy?: number } = { sup: supervisorPid(sb), proxy: (await health(sb.port))!.pid };
             const refuse = async (label: string, args: Record<string, string | number | true | null>, reasons: RegExp[]) => {
                 const r = await deploy(sb, { PreflightOnly: true, ...args });
                 assert.equal(r.code, 2, `${label}: expected exit 2\n${r.out}`);
                 assert.match(r.out, / RESULT refused \(exit 2\)/, label);
                 for (const re of reasons) assert.match(r.out, re, `${label}\n${r.out}`);
-                assertUntouched(sb, before);
+                assertUntouched(sb, before, ids);
             };
 
             // Positive control first: the same sandbox passes when nothing is wrong.
@@ -517,6 +524,12 @@ describe("live-deploy scripts: refusals leave everything untouched", { skip: SKI
             patchTask(sb, { enabled: true });
             assertUntouched(sb, before);
             await refuse("unknown task", { TaskName: "No such task" }, [/expected exactly one task with this name, found 0/]);
+            // A task whose action only resembles this launcher, or is not run by Windows PowerShell.
+            patchTask(sb, { launcherSuffix: ".disabled" });
+            await refuse("task runs another file", {}, [/FAIL scheduled task runs this launcher: the task action does not run the launcher/]);
+            patchTask(sb, { launcherSuffix: "", execute: "pwsh.exe" });
+            await refuse("task runs another program", {}, [/FAIL scheduled task runs this launcher: the task action is not Windows PowerShell/]);
+            patchTask(sb, { execute: "" });
 
             // Preflight: launcher shape.
             fs.appendFileSync(path.join(sb.root, LAUNCHER), "    [string]$ExpectedCommit = 'again',\n");
@@ -566,6 +579,7 @@ describe("live-deploy scripts: refusals leave everything untouched", { skip: SKI
             const sup = supervisorPid(sb);
             process.kill(sup);
             await waitFor("supervisor to exit", () => !alive(sup));
+            ids = { proxy: ids.proxy };
             await refuse("no supervisor", {}, [/expected one supervisor, found 0/]);
         });
     });
@@ -577,9 +591,11 @@ describe("live-deploy scripts: refusals leave everything untouched", { skip: SKI
 describe("live-deploy scripts: deployment and rollback", { skip: SKIP, concurrency: 4 }, () => {
     test("deploys, proves supervision, rewrites receipts; the standalone rollback restores everything", async () => {
         // A second sandbox whose name is a prefix-sibling of the first proves the scripts never touch another installation.
-        const other = await makeSandbox("a10");
+        const stem = crypto.randomBytes(5).toString("hex");
+        const other = await makeSandbox("0", CAND, stem);
         try {
             await withSandbox(async (sb) => {
+                assert.equal(other.root.startsWith(sb.root) && other.root !== sb.root, true, "the other root must extend this root's name");
                 const otherPids = { sup: supervisorPid(other), proxy: (await health(other.port))!.pid };
                 const before = launcher(sb);
                 const tunedBefore = fs.readFileSync(path.join(sb.root, "tuned-deployment.json"));
@@ -685,7 +701,7 @@ describe("live-deploy scripts: deployment and rollback", { skip: SKIP, concurren
                 assert.equal((await health(other.port))!.pid, otherPids.proxy);
                 assert.equal(inhibit(other), null);
                 assert.equal(getTask(other).calls.disable, 0);
-            }, "a1");
+            }, "", CAND, stem);
         } finally {
             await teardown(other);
         }
@@ -866,6 +882,78 @@ describe("live-deploy scripts: deployment and rollback", { skip: SKIP, concurren
             const refused = await rollback(sb, onlyBackup(sb));
             assert.equal(refused.code, 2, refused.out);
             assert.match(refused.out, /launcher was changed after this deployment/);
+        });
+    });
+
+    test("a launcher edited by someone else while the rollback runs is never overwritten", async () => {
+        await withSandbox(async (sb) => {
+            const sup = supervisorPid(sb);
+            fs.writeFileSync(path.join(sb.root, "proxy-control.json"), JSON.stringify({ "cand-1": { unhealthy: true } }));
+            // The second "disable" is the rollback's own hold: the edit lands after the rollback has started.
+            patchTask(sb, { onCall: [{ op: "disable", call: 2, action: "editLauncher" }] });
+            const r = await deploy(sb, { HealthWaitSeconds: 6 });
+            expectResult(r, 4, "rollback-failed", "foreign-launcher-edit");
+            assertHold(sb, onlyBackup(sb), sup);
+            assert.match(launcher(sb), /# foreign edit/, "the foreign edit must survive");
+            assert.match(launcher(sb), /cand-1/, "the launcher must be left as found, not restored");
+        });
+    });
+
+    test("a healthy candidate that the supervisor does not vouch for is rolled back", async () => {
+        await withSandbox(async (sb) => {
+            const before = launcher(sb);
+            // The candidate itself answers health correctly in both runs; only the supervisor's report is off.
+            for (const [override, why] of [
+                [{ healthMatch: false }, /not healthy under supervision: supervisor reports no health match/],
+                [{ childPid: 1 }, /not healthy under supervision: supervisor monitors a process that is not the listener/],
+            ] as const) {
+                fs.writeFileSync(path.join(sb.root, "status-control.json"), JSON.stringify({ [CAND.commit]: override }));
+                const r = await deploy(sb, { HealthWaitSeconds: 20 });
+                expectResult(r, 3, "rolled-back", "cutover-failed");
+                assert.match(r.out, why);
+                await waitSupervised(sb, PREV.version, PREV.commit);
+                assert.equal(launcher(sb), before);
+                assert.equal(fs.existsSync(releaseDir(sb)), false);
+            }
+        });
+    });
+
+    test("a second deploy is refused while one is running", async () => {
+        await withSandbox(async (sb) => {
+            const first = deploy(sb);
+            await waitFor("the first run to write its backup", () => backups(sb).length === 1);
+            const second = await deploy(sb, { ReleaseName: "cand-2" });
+            assert.equal(second.code, 2, second.out);
+            assert.match(second.out, /another deploy or rollback is running for this runtime root/);
+            assert.equal(fs.existsSync(releaseDir(sb, "cand-2")), false);
+            expectResult(await first, 0, "deployed");
+            assert.equal(backups(sb).length, 1);
+            assert.equal(fs.existsSync(path.join(sb.root, "live-deploy.lock")), false, "the operation lock goes away with the process");
+        });
+    });
+
+    test("a standalone rollback that died mid-run can be run again", async () => {
+        await withSandbox(async (sb) => {
+            const before = launcher(sb);
+            expectResult(await deploy(sb), 0, "deployed");
+            const backup = onlyBackup(sb);
+            // Killed in the middle of its lift: candidate stopped, inhibit removed, task still disabled.
+            patchTask(sb, { onCall: [{ op: "enable", call: 2, action: "killSelf" }] });
+            const killed = await rollback(sb, backup);
+            assert.notEqual(killed.code, 0);
+            assert.equal(record(backup).stage, "rolling-back");
+            assert.equal(inhibit(sb), null);
+            assert.equal(getTask(sb).enabled, false);
+            patchTask(sb, { onCall: [] });
+            // A live receipt that went missing is restored from the backup, not a reason to stop.
+            fs.rmSync(path.join(sb.root, "tuned-deployment.json"));
+            const back = await rollback(sb, backup);
+            expectResult(back, 0, "restored");
+            await waitSupervised(sb, PREV.version, PREV.commit);
+            assert.equal(launcher(sb), before);
+            assert.equal(getTask(sb).enabled, true);
+            assert.deepEqual(fs.readFileSync(path.join(sb.root, "tuned-deployment.json")), fs.readFileSync(path.join(backup, "tuned-deployment.json")));
+            assert.equal(record(backup).stage, "rolled-back");
         });
     });
 

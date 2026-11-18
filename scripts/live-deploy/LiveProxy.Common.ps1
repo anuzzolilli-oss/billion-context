@@ -7,7 +7,7 @@ $script:LpUtf8 = [System.Text.UTF8Encoding]::new($false)
 $script:LpPollMs = 500
 $script:LpSeam = $false
 $script:LpRoot = $null
-$script:LpStages = @('prepared', 'aborted', 'holding', 'held', 'cut', 'healthy', 'receipts-written', 'rolled-back', 'rollback-failed')
+$script:LpStages = @('prepared', 'aborted', 'holding', 'held', 'cut', 'healthy', 'receipts-written', 'rolling-back', 'rolled-back', 'rollback-failed')
 $script:LpForwardStages = @('prepared', 'holding', 'held', 'cut', 'healthy', 'receipts-written')
 $script:LpPatterns = @{
     Version      = '^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$'
@@ -225,21 +225,38 @@ function Get-LpClientCount($Ctx) {
     return @($rows | Where-Object { @('127.0.0.1', '::1') -contains [string]$_.RemoteAddress -and $own -notcontains [int]$_.OwningProcess }).Count
 }
 
-# Processes of one image whose command line contains the given path as a quoted token.
-function Get-LpProcesses([string]$ImageName, [string]$QuotedPath) {
-    $token = '"' + $QuotedPath + '"'
+# Processes of one image whose command line contains the given text. The text names how the process was
+# started, not just a path: a process that merely receives the path as an argument does not match.
+function Get-LpProcesses([string]$ImageName, [string]$Needle) {
     return @(Get-CimInstance Win32_Process -Filter "Name='$ImageName'" -OperationTimeoutSec 15 -ErrorAction Stop |
-        Where-Object { $null -ne $_.CommandLine -and $_.CommandLine.IndexOf($token, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 })
+        Where-Object { $null -ne $_.CommandLine -and $_.CommandLine.IndexOf($Needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 })
 }
-function Get-LpSupervisors($Ctx) { return @(Get-LpProcesses 'powershell.exe' $Ctx.LauncherPath) }
-function Get-LpProxies([string]$ProxyPath) { return @(Get-LpProcesses 'node.exe' $ProxyPath) }
+# The supervisor is Windows PowerShell running the launcher as its -File script.
+function Get-LpSupervisors($Ctx) { return @(Get-LpProcesses 'powershell.exe' ('-File "' + $Ctx.LauncherPath + '"')) }
+# A proxy is node running the bundle as its entry point: "<node>" "<bundle>" start ...
+function Get-LpProxies([string]$ProxyPath) {
+    $needle = '" "' + $ProxyPath + '" start '
+    return @(Get-LpProcesses 'node.exe' $needle | Where-Object { $_.CommandLine.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -eq $_.CommandLine.IndexOf('" "', [System.StringComparison]::Ordinal) })
+}
 
-# Stops one process after re-checking that the PID still belongs to the process that was matched.
+# Stops the process that was matched. One handle is opened, its start time is compared with the matched
+# process, and the same handle is used to stop it, so a PID reused in between cannot be hit.
 function Stop-LpProcessVerified($Process) {
-    $now = Get-CimInstance Win32_Process -Filter "ProcessId=$($Process.ProcessId)" -OperationTimeoutSec 15 -ErrorAction Stop
-    if ($null -eq $now) { return }
-    if ($now.CreationDate -ne $Process.CreationDate) { throw "pid $($Process.ProcessId) now belongs to a different process; not stopping it" }
-    Stop-Process -Id $Process.ProcessId -Force -ErrorAction Stop
+    $p = $null
+    try { $p = [System.Diagnostics.Process]::GetProcessById([int]$Process.ProcessId) } catch [System.ArgumentException] { return }
+    try {
+        try {
+            $null = $p.SafeHandle
+            $started = $p.StartTime.ToUniversalTime()
+        } catch {
+            if ($p.HasExited) { return }
+            throw
+        }
+        if ([Math]::Abs(($started - $Process.CreationDate.ToUniversalTime()).TotalSeconds) -ge 1) { throw "pid $($Process.ProcessId) now belongs to a different process; not stopping it" }
+        try { $p.Kill() } catch { if (-not $p.HasExited) { throw } }
+    } finally {
+        $p.Dispose()
+    }
 }
 
 function Wait-LpUntil([scriptblock]$Condition, [int]$Seconds, [string]$What) {
@@ -291,6 +308,16 @@ function Get-LiveProxyTaskInfo([string]$TaskName) {
         TriggerCount = @($t[0].Triggers).Count
     }
 }
+# Reason the task cannot be the one that runs this launcher, or $null. The action must be Windows PowerShell
+# with the launcher as its -File script; a path that merely starts with the launcher path does not count.
+function Get-LpTaskActionGap($Task, [string]$LauncherPath) {
+    if ([System.IO.Path]::GetFileName([string]$Task.Execute) -ine 'powershell.exe') { return 'the task action is not Windows PowerShell (powershell.exe)' }
+    if (([string]$Task.ActionArguments).IndexOf('-File "' + $LauncherPath + '"', [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return 'the task action does not run the launcher in this runtime root' }
+    return $null
+}
+function Test-LpSameTask($A, $B) {
+    return ($A.Count -eq $B.Count -and $A.Enabled -eq $B.Enabled -and $A.Execute -eq $B.Execute -and $A.ActionArguments -eq $B.ActionArguments -and $A.TriggerCount -eq $B.TriggerCount)
+}
 function Disable-LiveProxyTask([string]$TaskName) { Get-LpTaskObjects $TaskName | Disable-ScheduledTask -ErrorAction Stop | Out-Null }
 function Enable-LiveProxyTask([string]$TaskName) { Get-LpTaskObjects $TaskName | Enable-ScheduledTask -ErrorAction Stop | Out-Null }
 function Start-LiveProxyTask([string]$TaskName) { Get-LpTaskObjects $TaskName | Start-ScheduledTask -ErrorAction Stop }
@@ -311,6 +338,19 @@ function Resolve-LpTaskDriver([string]$RootAsGiven, [string]$RootResolved, [stri
     return $driver
 }
 
+# ---- one operation at a time ---------------------------------------------------------------------
+
+# Deploy and rollback hold this lock from before their checks until the process ends, so two runs for the
+# same runtime root cannot interleave. The file is removed when the handle closes, also if the process dies.
+function Enter-LpOperation([string]$Root) {
+    $path = Join-Path $Root 'live-deploy.lock'
+    try {
+        $script:LpOperationLock = [System.IO.FileStream]::new($path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None, 1, [System.IO.FileOptions]::DeleteOnClose)
+    } catch [System.IO.IOException] {
+        throw 'another deploy or rollback is running for this runtime root'
+    }
+}
+
 # ---- hold and lift -----------------------------------------------------------------------------
 
 function Get-LpInhibitText($Ctx) {
@@ -326,7 +366,16 @@ function Test-LpOwnInhibit($Ctx) {
 function New-LpInhibit($Ctx, [string]$Verb) {
     $bytes = $script:LpUtf8.GetBytes("$Verb $($Ctx.DeploymentId)")
     $s = [System.IO.File]::Open($Ctx.InhibitPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-    try { $s.Write($bytes, 0, $bytes.Length) } finally { $s.Dispose() }
+    $written = $false
+    try {
+        $s.Write($bytes, 0, $bytes.Length)
+        $s.Flush($true)
+        $written = $true
+    } finally {
+        $s.Dispose()
+        # The file exists only because this call created it: a marker without its owner text must not stay.
+        if (-not $written) { Remove-Item -LiteralPath $Ctx.InhibitPath -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 function Assert-LpNoSupervisor($Ctx, [string]$When) {
@@ -348,6 +397,7 @@ function Set-LpRollbackHold($Ctx) {
 
 function Remove-LpHold($Ctx) {
     Assert-LpNoSupervisor $Ctx 'before the hold is lifted'
+    if (-not (Test-LpOwnInhibit $Ctx)) { throw 'maintenance.inhibit is no longer the one this run created; it was left as found' }
     Remove-Item -LiteralPath $Ctx.InhibitPath -Force
     $Ctx.LiftAt = (Get-Date).ToUniversalTime()
     Enable-LiveProxyTask $Ctx.TaskName
@@ -369,7 +419,12 @@ function Get-LpSuccessGap($Ctx, $Identity) {
     $sups = @(Get-LpSupervisors $Ctx)
     if ($sups.Count -ne 1) { return "supervisors: $($sups.Count)" }
     if (-not (Test-Path -LiteralPath $Ctx.StatusPath)) { return 'supervisor-status.json is absent' }
-    try { $st = [System.IO.File]::ReadAllText($Ctx.StatusPath) | ConvertFrom-Json -AsHashtable } catch { return 'supervisor-status.json is unreadable' }
+    # The supervisor rewrites this file every heartbeat; a read that lands on the rewrite is tried again.
+    $st = $null
+    foreach ($try in 1..5) {
+        try { $st = [System.IO.File]::ReadAllText($Ctx.StatusPath) | ConvertFrom-Json -AsHashtable; break } catch { Start-Sleep -Milliseconds 100 }
+    }
+    if ($null -eq $st) { return 'supervisor-status.json is unreadable' }
     $beat = $null
     try { $beat = ([datetime]$st['heartbeatAt']).ToUniversalTime() } catch { return 'supervisor-status.json has no heartbeat time' }
     if ($beat -le $Ctx.LiftAt) { return 'no supervisor heartbeat since the hold was lifted' }
@@ -496,13 +551,16 @@ function Invoke-LpRollback($Ctx, [byte[]]$RestoreLauncherBytes, [hashtable]$Rece
             if (Test-LpSameHash (Get-LpSha256 $Ctx.LauncherPath) $Ctx.Record.launcherSha256Before) {
                 Write-LpEvent 'STEP' 'launcher already is the pre-deployment launcher'
             } else {
+                if (-not (Test-LpSameHash (Get-LpSha256 $Ctx.LauncherPath) $Ctx.Record.launcherSha256After)) {
+                    Stop-LpRollbackFailed $Ctx 'launcher restore: the launcher is neither the saved nor the deployed one; it was changed by someone else and left as found' 'foreign-launcher-edit'
+                }
                 if (-not (Test-LpSameHash (Get-LpSha256OfBytes $RestoreLauncherBytes) $Ctx.Record.launcherSha256Before)) { throw 'the saved launcher does not match the deployment record' }
                 Write-LpBytesAtomic $Ctx.LauncherPath $RestoreLauncherBytes
                 Write-LpEvent 'STEP' 'launcher restored and verified'
             }
             $step = 'receipt restore'
             foreach ($path in $Receipts.Keys) {
-                if (Test-LpSameHash (Get-LpSha256 $path) (Get-LpSha256OfBytes $Receipts[$path])) { continue }
+                if ((Test-Path -LiteralPath $path -PathType Leaf) -and (Test-LpSameHash (Get-LpSha256 $path) (Get-LpSha256OfBytes $Receipts[$path]))) { continue }
                 Write-LpBytesAtomic $path $Receipts[$path]
                 Write-LpEvent 'STEP' "$(Get-LpRelative $path) restored and verified"
             }

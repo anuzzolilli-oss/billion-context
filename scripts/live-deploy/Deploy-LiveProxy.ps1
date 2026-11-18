@@ -1,4 +1,4 @@
-#requires -Version 7.0
+#requires -Version 7.2
 <#
 .SYNOPSIS
 Deploys a tested candidate build as the live proxy release, following the documented procedure.
@@ -128,6 +128,9 @@ try {
     $tunedPath = Join-Path $root 'tuned-deployment.json'
     $supervisionPath = Join-Path $root 'supervision-receipt.json'
 
+    # A full run takes the operation lock before it looks at anything; -PreflightOnly creates no file at all.
+    if (-not $PreflightOnly) { Enter-LpOperation $root }
+
     # ---- preflight: read-only, every check runs ----------------------------------------------------
     $candidateFiles = [ordered]@{ 'index.mjs' = 'dist\index.mjs'; 'build-info.json' = 'dist\build-info.json'; 'package.json' = 'package.json'; 'LICENSE' = 'LICENSE' }
     $candidateBytes = @{}; $candidateSha = [ordered]@{}
@@ -166,7 +169,8 @@ try {
         $t = Get-LiveProxyTaskInfo $TaskName
         if ($t.Count -ne 1) { return "expected exactly one task with this name, found $($t.Count)" }
         if (-not $t.Enabled) { return 'the task is disabled' }
-        if ($t.ActionArguments.IndexOf($ctx.LauncherPath, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return 'the task action does not run the launcher in this runtime root' }
+        $actionGap = Get-LpTaskActionGap $t $ctx.LauncherPath
+        if ($actionGap) { return $actionGap }
         $ctx.TaskBaseline = $t
     }
     Add-Check 'configuration hash' { if (-not (Test-LpSameHash (Get-LpSha256 $ctx.ConfigPath) $ExpectedConfigSha256)) { 'the configuration file differs from -ExpectedConfigSha256' } }
@@ -277,7 +281,7 @@ try {
     Write-LpEvent 'BACKUP' $backupRoot
     $r = Invoke-LpLauncherDryRun $editedBytes $root
     if ($r.ExitCode -ne 0 -or $r.Action -ne 'conflict') { throw "with the new release in place the edited launcher decided '$($r.Action)' (exit $($r.ExitCode)); expected 'conflict' while the current release is still serving" }
-    $ctx.TaskBaseline = Get-LiveProxyTaskInfo $TaskName
+    if (-not (Test-LpSameTask (Get-LiveProxyTaskInfo $TaskName) $ctx.TaskBaseline)) { throw 'the scheduled task was changed after preflight' }
     Set-LpStage $ctx 'holding'
     try { New-LpInhibit $ctx 'deploy' } catch { throw "maintenance.inhibit could not be created ($($_.Exception.Message)); other maintenance may have started" }
 } catch {
@@ -322,15 +326,17 @@ try {
     Write-LpEvent 'STEP' "FAILED: $($_.Exception.Message); rolling back"
     try {
         Invoke-LpRollback $ctx $launcherBytes @{} $holdOnly
-        Set-LpStage $ctx 'rolled-back'
+        # The previous release is live and checked from here on: a bookkeeping error must not read as a failed rollback.
         $note = ''
-        try { Remove-CreatedRelease $newRoot } catch { $note = " The release directory could not be removed: $($_.Exception.Message)." }
+        try { Set-LpStage $ctx 'rolled-back' } catch { $note = ' The deployment record could not be updated.' }
+        try { Remove-CreatedRelease $newRoot } catch { $note += " The release directory could not be removed: $($_.Exception.Message)." }
         $next = if ($reason -eq 'not-idle') { 'retry later with the same parameters, when no client is connected' } else { 'investigate the failure above before retrying' }
         Complete-Lp $ctx ([LpStop]::new(3, 'rolled-back', "nothing was deployed; the previous release is live under supervision.$note", $reason, $next)) 'result.json'
     } catch [LpStop] {
         Complete-Lp $ctx $_.Exception 'result.json'
     } catch {
-        Complete-Lp $ctx ([LpStop]::new(4, 'rollback-failed', "rollback stopped unexpectedly: $($_.Exception.Message). Check by hand that maintenance.inhibit is present, the task is disabled and no supervisor runs.", 'rollback-error', 'report to the owner; no release is confirmed live')) 'result.json'
+        # Exit 4 always means the hold was re-applied and evidence was collected.
+        try { Stop-LpRollbackFailed $ctx "unexpected error ($($_.Exception.Message))" 'rollback-error' } catch [LpStop] { Complete-Lp $ctx $_.Exception 'result.json' }
     }
 }
 

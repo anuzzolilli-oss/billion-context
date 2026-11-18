@@ -62,10 +62,21 @@ function Write-Status([hashtable]$s) {
         if (Test-Path -LiteralPath $statusPath) { [System.IO.File]::Replace($tmp, $statusPath, [NullString]::Value) } else { [System.IO.File]::Move($tmp, $statusPath) }
     } catch { }
 }
+# Test control: <runtime root>\status-control.json = { "<commit>": { "healthMatch": false, "childPid": 1 } }
+# overrides what this supervisor reports for that release; the proxy and its health are not affected.
+function Get-StatusOverride {
+    try {
+        $c = [System.IO.File]::ReadAllText((Join-Path $RuntimeRoot 'status-control.json')) | ConvertFrom-Json
+        return $c.$ExpectedCommit
+    } catch { return $null }
+}
 function Watch-Child($proc, [string]$mode) {
     $created = $proc.StartTime.ToString('o')
     while (!$proc.HasExited) {
-        Write-Status @{ state = $mode; childPid = $proc.Id; childCreated = $created; healthMatch = (Test-Health $proc.Id); inhibit = (Test-Path -LiteralPath $inhibitPath) }
+        $s = @{ state = $mode; childPid = $proc.Id; childCreated = $created; healthMatch = (Test-Health $proc.Id); inhibit = (Test-Path -LiteralPath $inhibitPath) }
+        $o = Get-StatusOverride
+        if ($null -ne $o) { foreach ($p in $o.PSObject.Properties) { $s[$p.Name] = $p.Value } }
+        Write-Status $s
         Start-Sleep -Milliseconds ([int]($HeartbeatSeconds * 1000))
     }
 }

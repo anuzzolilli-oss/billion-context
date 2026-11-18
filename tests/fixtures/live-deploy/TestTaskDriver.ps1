@@ -2,6 +2,7 @@
 # The deploy scripts dot-source it when -TestTaskDriver is given and the runtime root is a marked sandbox.
 # State lives in <runtime root>\sandbox-task.json:
 #   { taskName, enabled, port, calls: { info, disable, enable, start },
+#     execute, launcherSuffix,                  optional: what the task action claims to run
 #     failOn: [ { op, call } ],                 the n-th call of that operation throws
 #     onCall: [ { op, call, action } ] }        the n-th call first performs a fault action
 # Actions: openClient, makeLauncherReadOnly, writeForeignInhibit, editLauncher, killSelf.
@@ -44,8 +45,8 @@ function Get-LiveProxyTaskInfo([string]$TaskName) {
     $s = Get-LpTestTaskState
     if ($TaskName -ne [string]$s.taskName) { return [pscustomobject]@{ Count = 0; Enabled = $false; Execute = ''; ActionArguments = ''; TriggerCount = 0 } }
     return [pscustomobject]@{
-        Count = 1; Enabled = [bool]$s.enabled; Execute = 'powershell.exe'
-        ActionArguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$(Get-LpTestLauncher)`""; TriggerCount = 2
+        Count = 1; Enabled = [bool]$s.enabled; Execute = $(if ($s['execute']) { [string]$s['execute'] } else { 'powershell.exe' })
+        ActionArguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$(Get-LpTestLauncher)$([string]$s['launcherSuffix'])`""; TriggerCount = 2
     }
 }
 function Disable-LiveProxyTask([string]$TaskName) {
