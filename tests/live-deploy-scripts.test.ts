@@ -710,9 +710,10 @@ describe("live-deploy scripts: deployment and rollback", { skip: SKIP, concurren
 
     test("a candidate that never becomes healthy is rolled back to the previous release", async () => {
         await withSandbox(async (sb) => {
+            // The same wait also bounds the previous release coming back, so it must not be tight.
             const before = launcher(sb);
             fs.writeFileSync(path.join(sb.root, "proxy-control.json"), JSON.stringify({ "cand-1": { unhealthy: true } }));
-            const r = await deploy(sb, { HealthWaitSeconds: 6 });
+            const r = await deploy(sb, { HealthWaitSeconds: 20 });
             expectResult(r, 3, "rolled-back", "cutover-failed");
             await waitSupervised(sb, PREV.version, PREV.commit);
             assert.equal(launcher(sb), before);
@@ -963,6 +964,14 @@ describe("live-deploy scripts: deployment and rollback", { skip: SKIP, concurren
             assert.match(foreign.out, /belongs to other maintenance/);
             assert.equal(inhibit(sb), "someone else");
             fs.rmSync(path.join(sb.root, "maintenance.inhibit"));
+            // A task disabled by someone else: a finished deployment does not explain it.
+            patchTask(sb, { enabled: false });
+            const disabled = await rollback(sb, backup);
+            assert.equal(disabled.code, 2, disabled.out);
+            assert.match(disabled.out, /scheduled task is disabled and neither this deployment's hold nor its stage/);
+            assert.equal(getTask(sb).enabled, false, "a task disabled by someone else stays disabled");
+            assert.equal(launcher(sb), live);
+            patchTask(sb, { enabled: true });
             // Still the current deployment: the same backup is accepted once nothing is wrong.
             expectResult(await rollback(sb, backup, { PreflightOnly: true }), 0, "preflight-ok");
         });

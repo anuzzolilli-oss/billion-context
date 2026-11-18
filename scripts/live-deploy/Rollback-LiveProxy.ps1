@@ -115,6 +115,8 @@ try {
     if (-not $isBefore -and -not $isAfter) { Stop-Refused 'the launcher was changed after this deployment; this is not the current deployment''s backup' }
     if ($stage -eq 'rolled-back') { Stop-Refused 'this deployment was already rolled back' }
     if (@('prepared', 'aborted') -contains $stage) { Stop-Refused "this deployment stopped at stage '$stage' and changed nothing" }
+    # A disabled task is this deployment's doing only if its own hold is in place or it stopped inside the hold window.
+    if (-not $task.Enabled -and -not $ownHold -and @('holding', 'held', 'cut', 'rollback-failed') -notcontains $stage) { Stop-Refused "the scheduled task is disabled and neither this deployment's hold nor its stage '$stage' explains it; other maintenance may be in progress" }
 
     $ctx.ConfigSha = Get-LpSha256 $ctx.ConfigPath
     $receipts = @{}
